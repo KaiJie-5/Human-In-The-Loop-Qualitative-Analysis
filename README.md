@@ -32,7 +32,7 @@ If you cloned it into another directory, replace the path above with the locatio
 
 ### Tested system
 
-The pipeline has been exercised on the following local system. These are tested versions, not strict minimum requirements.
+The pipeline has been tested on the following local system. These are tested versions, not strict minimum requirements.
 
 | Component | Tested configuration |
 |---|---|
