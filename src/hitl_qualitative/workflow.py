@@ -14,7 +14,6 @@ from .candidates import (
     candidate_to_json,
     parse_candidate,
     render_candidate,
-    validate_candidate,
 )
 from .categories import CATEGORY_CONTRACT_VERSION
 from .database import ReviewItem, SQLiteStore, utc_now
@@ -32,7 +31,6 @@ DECISIONS = {"prefer_a", "prefer_b", "both_poor", "too_similar", "skip"}
 ISSUE_TAGS = (
     "Evidence problem",
     "Context used as evidence",
-    "Category boundary",
     "Research-question relation",
     "Reflective question",
     "Specificity",
@@ -48,6 +46,7 @@ class CandidateView:
     valid: bool
     rendered_text: str | None
     validation_errors: tuple[str, ...]
+    parsed: dict[str, Any] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +55,7 @@ class SnapshotView:
     status: str
     code_label: str
     attempt_number: int
+    category_version: str
     previous: tuple[TranscriptTurn, ...]
     target: tuple[TranscriptTurn, ...]
     following: tuple[TranscriptTurn, ...]
@@ -68,14 +68,17 @@ class ReviewService:
         self,
         store: SQLiteStore,
         ollama: OllamaClient,
-        *,
-        maximum_pair_attempts: int = 3,
     ):
         self.store = store
         self.ollama = ollama
-        self.maximum_pair_attempts = maximum_pair_attempts
 
-    def generate_pair(self, item: ReviewItem, exact_code_label: str) -> SnapshotView:
+    def generate_pair(
+        self,
+        item: ReviewItem,
+        exact_code_label: str,
+        *,
+        replace_snapshot_id: int | None = None,
+    ) -> SnapshotView:
         if not exact_code_label.strip():
             raise ValueError("Enter a qualitative code before generation.")
         study = self.store.get_study(item.study_id)
@@ -133,6 +136,7 @@ class ReviewService:
             following=following,
             options=options,
             prompt=prompt,
+            replace_snapshot_id=replace_snapshot_id,
         )
         self._complete_snapshot(snapshot_id)
         return self.load_snapshot(snapshot_id)
@@ -187,6 +191,7 @@ class ReviewService:
                 candidate_number=int(row["candidate_number"]), valid=bool(row["valid"]),
                 rendered_text=row["rendered_text"],
                 validation_errors=tuple(json.loads(row["validation_errors_json"])),
+                parsed=_json_object(row["parsed_json"]),
             )
             for row in candidate_rows
         )
@@ -201,6 +206,7 @@ class ReviewService:
             id=int(snapshot["id"]), status=str(snapshot["status"]),
             code_label=str(snapshot["code_label"]),
             attempt_number=int(snapshot["attempt_number"]),
+            category_version=str(snapshot["category_version"]),
             previous=tuple(contexts["previous"]), target=tuple(contexts["target"]),
             following=tuple(contexts["next"]), questions=questions, candidates=candidates,
         )
@@ -295,6 +301,19 @@ class ReviewService:
                 "UPDATE review_items SET status = 'decided', updated_at = ? WHERE id = ?",
                 (now, item.id),
             )
+            if snapshot is not None:
+                connection.execute(
+                    """
+                    DELETE FROM generation_snapshots
+                    WHERE review_item_id = ? AND reviewer_id = ? AND id <> ?
+                    """,
+                    (item.id, item.reviewer_id, snapshot["id"]),
+                )
+            elif decision == "skip":
+                connection.execute(
+                    "DELETE FROM generation_snapshots WHERE review_item_id = ? AND reviewer_id = ?",
+                    (item.id, item.reviewer_id),
+                )
             return int(cursor.lastrowid)
 
     def _create_or_reuse_snapshot(
@@ -309,6 +328,7 @@ class ReviewService:
         following: Sequence[TranscriptTurn],
         options: dict[str, Any],
         prompt: Any,
+        replace_snapshot_id: int | None,
     ) -> int:
         with self.store.transaction() as connection:
             decided = connection.execute(
@@ -325,17 +345,37 @@ class ReviewService:
                 """,
                 (item.id, item.reviewer_id),
             ).fetchone()
-            if existing is not None and existing["input_fingerprint"] == prompt.input_fingerprint:
+            if replace_snapshot_id is not None:
+                source = connection.execute(
+                    """
+                    SELECT * FROM generation_snapshots
+                    WHERE id = ? AND review_item_id = ? AND reviewer_id = ?
+                    """,
+                    (replace_snapshot_id, item.id, item.reviewer_id),
+                ).fetchone()
+                if source is None:
+                    if existing is not None:
+                        return int(existing["id"])
+                    raise ValueError("The response pair selected for regeneration no longer exists.")
+                if source["superseded_by"] is not None:
+                    replacement = connection.execute(
+                        "SELECT id FROM generation_snapshots WHERE id = ?",
+                        (source["superseded_by"],),
+                    ).fetchone()
+                    if replacement is not None:
+                        return int(replacement["id"])
+                if existing is not None and int(existing["id"]) != replace_snapshot_id:
+                    return int(existing["id"])
+            elif existing is not None and existing["input_fingerprint"] == prompt.input_fingerprint:
                 return int(existing["id"])
-            count = int(connection.execute(
-                "SELECT COUNT(*) FROM generation_snapshots WHERE review_item_id = ? AND reviewer_id = ?",
+            previous_attempt = connection.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0)
+                FROM generation_snapshots WHERE review_item_id = ? AND reviewer_id = ?
+                """,
                 (item.id, item.reviewer_id),
-            ).fetchone()[0])
-            if count >= self.maximum_pair_attempts:
-                raise ValueError(
-                    f"This item has reached the limit of {self.maximum_pair_attempts} pair attempts."
-                )
-            attempt = count + 1
+            ).fetchone()[0]
+            attempt = int(previous_attempt) + 1
             now = utc_now()
             if existing is not None:
                 connection.execute(
@@ -456,6 +496,14 @@ class ReviewService:
                 "UPDATE review_items SET status = ?, updated_at = ? WHERE id = ?",
                 ("generated" if status == "ready" else "invalid", now, snapshot["review_item_id"]),
             )
+            if status == "ready":
+                connection.execute(
+                    """
+                    DELETE FROM generation_snapshots
+                    WHERE review_item_id = ? AND reviewer_id = ? AND id <> ?
+                    """,
+                    (snapshot["review_item_id"], snapshot["reviewer_id"], snapshot_id),
+                )
 
     def _generate_candidate(
         self,
@@ -573,10 +621,7 @@ class ReviewService:
             parsed = parse_candidate(response.content)
         except (ValidationError, ValueError, json.JSONDecodeError) as exc:
             return response, [f"Structured output validation failed: {exc}"], None, None
-        validated, errors = validate_candidate(parsed)
-        if errors or validated is None:
-            return response, errors, None, None
-        return response, [], validated, render_candidate(validated)
+        return response, [], parsed, render_candidate(parsed)
 
     def _save_call(
         self,
@@ -617,3 +662,13 @@ def decision_idempotency_key(item_id: int, decision: str, snapshot_id: int | Non
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None

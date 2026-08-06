@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .candidates import parse_candidate, render_candidate, without_redundant_response_fields
+from .candidates import normalize_response_text, parse_candidate, render_candidate
 from .categories import CATEGORY_CONTRACT_VERSION
 from .database import SQLiteStore, utc_now
 
@@ -251,8 +251,8 @@ class PreferenceExporter:
                 rows.append(
                     ExportMapper.row(
                         str(snapshot["exact_prompt"]),
-                        without_redundant_response_fields(str(chosen["rendered_text"])),
-                        without_redundant_response_fields(str(rejected["rendered_text"])),
+                        normalize_response_text(str(chosen["rendered_text"])),
+                        normalize_response_text(str(rejected["rendered_text"])),
                     )
                 )
                 seen.add(identity)
@@ -274,7 +274,7 @@ def _stable_rendering(candidate: Any, category_version: str) -> bool:
     if category_version != CATEGORY_CONTRACT_VERSION:
         # Historical candidates were validated under their saved contract. Preserve the
         # immutable audit record, but strip its retired display/export lines at the boundary.
-        return bool(without_redundant_response_fields(text).strip())
+        return bool(normalize_response_text(text).strip())
     try:
         parsed = parse_candidate(str(candidate["parsed_json"] or ""))
         expected = render_candidate(parsed)

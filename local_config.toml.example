@@ -15,4 +15,3 @@ temperature = 0.4
 top_p = 0.9
 output_tokens = 5000
 context_tokens = 65536
-maximum_pair_attempts = 3

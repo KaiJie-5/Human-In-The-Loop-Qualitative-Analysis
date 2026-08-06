@@ -10,6 +10,10 @@ The application runs locally and has three pages:
 - **Review:** assess transcript segments, generate two blinded model responses, and record a preference or audit decision.
 - **Progress and export:** monitor completion and export eligible `adaptation` preference pairs as chat JSONL.
 
+Candidate assessments are shown as structured cards. Each explicit regeneration uses two new
+seeds and replaces the prior pair only after the replacement finishes successfully; saved
+decisions remain immutable.
+
 ## Getting Started
 
 Install [Git for Windows](https://git-scm.com/download/win) and [Miniconda](https://docs.conda.io/projects/miniconda/en/latest/) or Anaconda, then open **Anaconda Prompt**.
@@ -412,6 +416,73 @@ ollama run hitl-smollm3-dpo:q4-k-m "Reply with only the word ready."
 ```
 
 The application sends its saved context length to Ollama as `num_ctx` for every generation. A 65,536-token context is the tested SmolLM3 model's architectural maximum, but it requires substantially more memory than a shorter context. If generation becomes slow or Ollama reports insufficient memory, select `32768` or `16384` under **Setup → Advanced generation settings**. See the official [Ollama model-import documentation](https://docs.ollama.com/import) and [Modelfile reference](https://docs.ollama.com/modelfile) for additional model formats and parameters.
+
+## Verification (Optional)
+
+The automated suite uses temporary SQLite databases and a fake Ollama client, so the normal
+tests do not require a running model. From Anaconda Prompt, activate the application environment
+and refresh the editable installation:
+
+```bat
+conda activate hitl-qda
+```
+
+```bat
+cd /d "C:\path\to\Human-In-The-Loop-Qualitative-Analysis"
+```
+
+```bat
+python -m pip install -e ".[dev]"
+```
+
+Run the candidate and transcript tests:
+
+```bat
+python -m pytest tests\test_transcripts_and_candidates.py -vv --tb=long
+```
+
+Run the workflow, regeneration, recovery, and export tests:
+
+```bat
+python -m pytest tests\test_workflow_and_export.py -vv --tb=long
+```
+
+Run the complete local suite while excluding optional external compatibility checks:
+
+```bat
+python -m pytest -vv --tb=long -m "not upstream_compat and not real_data_compat"
+```
+
+Save that output for diagnosis:
+
+```bat
+python -m pytest -vv --tb=long -m "not upstream_compat and not real_data_compat" > pytest-output.txt 2>&1
+```
+
+The optional compatibility checks use configurable environment variables so no external drive
+or repository path is committed in application logic:
+
+```bat
+set "DPO_REPOSITORY_PATH=C:\path\to\Direct-Preference-Optimization-of-LLMs-for-Critical-Thinking"
+```
+
+```bat
+python -m pytest tests\test_optional_compatibility.py::test_export_row_with_configured_upstream_loader -vv --tb=long -m upstream_compat
+```
+
+```bat
+set "DPO_REFERENCE_JSONL=X:\path\to\preference_pairs_category_evidence.jsonl"
+```
+
+```bat
+python -m pytest tests\test_optional_compatibility.py::test_first_twenty_real_rows_include_all_heading_contracts -vv --tb=long -m real_data_compat
+```
+
+Run and save both optional compatibility checks after configuring both paths:
+
+```bat
+python -m pytest tests\test_optional_compatibility.py -vv --tb=long -m "upstream_compat or real_data_compat" > pytest-compatibility-output.txt 2>&1
+```
 
 ## Run the Pipeline
 

@@ -35,8 +35,8 @@ def segment_payload(*, transcript_id: str = "INT001", record_id: str = "INT001_S
 
 def valid_candidate(category: str = "useful_analytical_code") -> dict[str, Any]:
     common = {
+        "evidence_quote": "I checked the bill twice.",
         "relation_to_research_questions": "It advances the question about how people handle unclear bills.",
-        "category_boundary": "It is grounded, specific, and analytically useful.",
         "reflective_question": "How does checking twice illuminate the participant's response to uncertainty?",
     }
     if category == "wrong_code":

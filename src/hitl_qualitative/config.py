@@ -25,7 +25,6 @@ class AppConfig:
     top_p: float = 0.9
     output_tokens: int = 5000
     context_tokens: int = 65536
-    maximum_pair_attempts: int = 3
 
 
 def load_config(
@@ -58,7 +57,6 @@ def load_config(
         top_p=float(review.get("top_p", 0.9)),
         output_tokens=int(review.get("output_tokens", 5000)),
         context_tokens=int(review.get("context_tokens", 65536)),
-        maximum_pair_attempts=int(review.get("maximum_pair_attempts", 3)),
     )
     _validate(config)
     return config
@@ -89,7 +87,7 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("temperature must be between 0 and 2.")
     if not 0 < config.top_p <= 1:
         raise ValueError("top_p must be greater than 0 and at most 1.")
-    if config.output_tokens <= 0 or config.context_tokens <= 0 or config.maximum_pair_attempts <= 0:
-        raise ValueError("Context tokens, output tokens, and maximum attempts must be positive.")
+    if config.output_tokens <= 0 or config.context_tokens <= 0:
+        raise ValueError("Context tokens and output tokens must be positive.")
     if config.output_tokens >= config.context_tokens:
         raise ValueError("output_tokens must be smaller than context_tokens.")

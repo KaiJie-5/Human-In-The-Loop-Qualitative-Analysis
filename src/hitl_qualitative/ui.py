@@ -8,7 +8,8 @@ from typing import Any
 
 import streamlit as st
 
-from .candidates import without_redundant_response_fields
+from .candidates import ResponseSection, normalize_response_text, response_sections
+from .categories import CATEGORY_CONTRACT_VERSION, CATEGORY_SPECS
 from .config import AppConfig, load_config
 from .database import QuestionDraft, SQLiteStore
 from .exporting import PreferenceExporter
@@ -359,7 +360,7 @@ def review_page() -> None:
         health_timeout_seconds=config.health_timeout_seconds,
         generation_timeout_seconds=config.generation_timeout_seconds,
     )
-    service = ReviewService(store, client, maximum_pair_attempts=config.maximum_pair_attempts)
+    service = ReviewService(store, client)
     snapshot = service.active_snapshot(item.id)
 
     health_key = f"health_ok_{item.study_id}"
@@ -412,6 +413,8 @@ def review_page() -> None:
     for question in questions:
         st.write(f"{question.text}")
 
+    generation_in_progress = bool(snapshot and snapshot.status == "generating")
+    generation_label = "Regenerate two responses" if snapshot else "Generate two responses"
     with st.form(f"generate_{item.id}"):
         code_label = st.text_area(
             "Researcher qualitative code",
@@ -420,13 +423,21 @@ def review_page() -> None:
             help="The exact submitted value is frozen into the generation snapshot and renderer.",
         )
         generate = st.form_submit_button(
-            "Generate two responses", type="primary",
-            disabled=not bool(study.get("model_digest")) or not health_ok,
+            generation_label, type="primary",
+            disabled=(
+                generation_in_progress
+                or not bool(study.get("model_digest"))
+                or not health_ok
+            ),
         )
     if generate:
         try:
             with st.spinner("Analysing and Generating"):
-                snapshot = service.generate_pair(item, code_label)
+                snapshot = service.generate_pair(
+                    item,
+                    code_label,
+                    replace_snapshot_id=(snapshot.id if snapshot else None),
+                )
             st.success("Both responses and their A/B assignment were saved.")
             st.rerun()
         except Exception as exc:
@@ -456,12 +467,20 @@ def review_page() -> None:
                 except Exception as exc:
                     st.error(str(exc))
         elif snapshot.candidates:
+            if snapshot.category_version != CATEGORY_CONTRACT_VERSION and any(
+                not _candidate_has_evidence(candidate.parsed, candidate.rendered_text)
+                for candidate in snapshot.candidates
+            ):
+                st.info(
+                    "This pair uses an older response contract without an evidence quote. "
+                    "Select Regenerate two responses to replace it with the current format."
+                )
             columns = st.columns(2, gap="large")
             for column, candidate in zip(columns, snapshot.candidates):
                 with column:
                     st.subheader(f"Response {candidate.display_label}")
                     if candidate.valid and candidate.rendered_text:
-                        st.text(without_redundant_response_fields(candidate.rendered_text))
+                        _show_response(candidate.parsed, candidate.rendered_text)
                     else:
                         st.error("This response remained invalid after one repair attempt.")
                         for error in candidate.validation_errors:
@@ -676,7 +695,8 @@ def _show_record_details(store: SQLiteStore, item_id: int) -> None:
         ).fetchone()
         candidates = connection.execute(
             """
-            SELECT ab.display_label, c.valid, c.rendered_text, c.validation_errors_json
+            SELECT ab.display_label, c.valid, c.parsed_json, c.rendered_text,
+                   c.validation_errors_json, gs.category_version
             FROM generation_snapshots gs
             JOIN ab_assignments ab ON ab.snapshot_id = gs.id
             JOIN candidates c ON c.id = ab.candidate_id
@@ -693,9 +713,77 @@ def _show_record_details(store: SQLiteStore, item_id: int) -> None:
     for candidate in candidates[:2]:
         st.markdown(f"**Response {candidate['display_label']}**")
         if candidate["rendered_text"]:
-            st.text(without_redundant_response_fields(str(candidate["rendered_text"])))
+            _show_response(_parsed_object(candidate["parsed_json"]), str(candidate["rendered_text"]))
         else:
             st.json(json.loads(candidate["validation_errors_json"]))
+
+
+def _show_response(parsed: dict[str, Any] | None, rendered_text: str) -> None:
+    sections = response_sections(parsed or {})
+    if not sections:
+        sections = _sections_from_rendered(rendered_text)
+    if sections:
+        st.markdown(_response_card_html(sections), unsafe_allow_html=True)
+        return
+    st.text(normalize_response_text(rendered_text))
+
+
+def _sections_from_rendered(rendered_text: str) -> tuple[ResponseSection, ...]:
+    allowed_labels = {
+        "Code category",
+        "Evidence quote",
+        *(heading for spec in CATEGORY_SPECS for _, heading in spec.rendered_fields),
+    }
+    sections: list[ResponseSection] = []
+    for line in normalize_response_text(rendered_text).splitlines():
+        label, separator, value = line.partition(":")
+        if separator and label in allowed_labels:
+            sections.append(
+                ResponseSection(label, value.lstrip(), is_evidence=label == "Evidence quote")
+            )
+        elif sections:
+            previous = sections[-1]
+            sections[-1] = ResponseSection(
+                previous.label,
+                f"{previous.value}\n{line}",
+                is_evidence=previous.is_evidence,
+            )
+    return tuple(sections)
+
+
+def _candidate_has_evidence(
+    parsed: dict[str, Any] | None,
+    rendered_text: str | None,
+) -> bool:
+    if parsed and (parsed.get("evidence_quote") or parsed.get("actual_segment_quote")):
+        return True
+    normalized = normalize_response_text(rendered_text or "")
+    return any(line.startswith("Evidence quote:") for line in normalized.splitlines())
+
+
+def _response_card_html(sections: tuple[ResponseSection, ...]) -> str:
+    fields: list[str] = []
+    for section in sections:
+        field_class = " response-field-evidence" if section.is_evidence else ""
+        label = html.escape(section.label)
+        value = html.escape(section.value).replace("\n", "<br>")
+        fields.append(
+            f'<div class="response-field{field_class}">'
+            f'<div class="response-field-label">{label}</div>'
+            f'<div class="response-field-value">{value}</div>'
+            "</div>"
+        )
+    return '<div class="response-card">' + "".join(fields) + "</div>"
+
+
+def _parsed_object(value: Any) -> dict[str, Any] | None:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def inject_styles() -> None:
@@ -713,6 +801,41 @@ def inject_styles() -> None:
             line-height: 1.6;
         }
         .target-label {font-size: 0.78rem; font-weight: 700; letter-spacing: 0.04em; margin-bottom: 0.4rem;}
+        .response-card {
+            border: 1px solid rgba(49, 51, 63, 0.18);
+            border-radius: 0.7rem;
+            padding: 0.35rem 1rem;
+            background: rgba(248, 249, 251, 0.72);
+        }
+        .response-field {
+            padding: 0.8rem 0;
+            border-bottom: 1px solid rgba(49, 51, 63, 0.10);
+        }
+        .response-field:last-child {border-bottom: 0;}
+        .response-field-label {
+            display: inline-block;
+            margin-bottom: 0.38rem;
+            padding: 0.16rem 0.48rem;
+            border-radius: 0.35rem;
+            background: rgba(45, 106, 79, 0.13);
+            color: #24553f;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.025em;
+        }
+        .response-field-value {line-height: 1.55; overflow-wrap: anywhere;}
+        .response-field-evidence {
+            margin: 0.45rem 0;
+            padding: 0.75rem 0.8rem;
+            border: 0;
+            border-left: 4px solid #4c956c;
+            border-radius: 0.35rem;
+            background: rgba(82, 183, 136, 0.10);
+        }
+        @media (prefers-color-scheme: dark) {
+            .response-card {background: rgba(28, 31, 36, 0.72);}
+            .response-field-label {color: #b7e4c7;}
+        }
         </style>
         """,
         unsafe_allow_html=True,

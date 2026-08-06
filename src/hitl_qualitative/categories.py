@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-CATEGORY_CONTRACT_VERSION = "hitl_code_categories_v2"
+CATEGORY_CONTRACT_VERSION = "hitl_code_categories_v3"
 CategoryId = Literal[
     "wrong_code",
     "descriptive_not_answering_rq",
@@ -30,10 +30,10 @@ CATEGORY_SPECS: tuple[CategorySpec, ...] = (
             "unsupported by the target segment."
         ),
         rendered_fields=(
+            ("evidence_quote", "Evidence quote"),
             ("why_plausible_for_wider_dataset", "Why plausible for wider dataset"),
             ("why_unsupported_by_this_segment", "Why unsupported by this segment"),
             ("relation_to_research_questions", "Relation to research questions"),
-            ("category_boundary", "Category boundary"),
             ("reflective_question", "Reflective question"),
         ),
     ),
@@ -45,11 +45,11 @@ CATEGORY_SPECS: tuple[CategorySpec, ...] = (
             "help answer the selected research questions."
         ),
         rendered_fields=(
+            ("evidence_quote", "Evidence quote"),
             ("surface_description", "Surface description"),
             ("why_true_of_segment", "Why true of segment"),
             ("why_not_useful_for_research_questions", "Why not useful for research questions"),
             ("relation_to_research_questions", "Relation to research questions"),
-            ("category_boundary", "Category boundary"),
             ("reflective_question", "Reflective question"),
         ),
     ),
@@ -61,11 +61,11 @@ CATEGORY_SPECS: tuple[CategorySpec, ...] = (
             "specific meaning in the segment."
         ),
         rendered_fields=(
+            ("evidence_quote", "Evidence quote"),
             ("broad_relevance_to_research_questions", "Broad relevance to research questions"),
             ("specific_meaning_lost", "Specific meaning lost"),
             ("why_it_is_too_broad", "Why it is too broad"),
             ("relation_to_research_questions", "Relation to research questions"),
-            ("category_boundary", "Category boundary"),
             ("reflective_question", "Reflective question"),
         ),
     ),
@@ -77,10 +77,10 @@ CATEGORY_SPECS: tuple[CategorySpec, ...] = (
             "for answering one or more selected research questions."
         ),
         rendered_fields=(
+            ("evidence_quote", "Evidence quote"),
             ("specific_analytical_insight", "Specific analytical insight"),
             ("why_it_is_useful", "Why it is useful"),
             ("relation_to_research_questions", "Relation to research questions"),
-            ("category_boundary", "Category boundary"),
             ("reflective_question", "Reflective question"),
         ),
     ),

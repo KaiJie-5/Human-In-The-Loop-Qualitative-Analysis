@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,10 +104,62 @@ def test_ab_mapping_drives_chosen_and_rejected_export(prepared_store, tmp_path: 
     validate_conversation_row(row)
     assert row["chosen"][0]["content"] == response_a.rendered_text
     assert "Code label:" not in row["chosen"][0]["content"]
-    assert "Evidence quote:" not in row["chosen"][0]["content"]
+    assert "Evidence quote:" in row["chosen"][0]["content"]
     assert "Actual segment quote:" not in row["chosen"][0]["content"]
+    assert "Category boundary:" not in row["chosen"][0]["content"]
     assert "reviewer-01" not in result.jsonl_path.read_text(encoding="utf-8")
     assert "reviewer-01" not in result.manifest_path.read_text(encoding="utf-8")
+
+
+def test_historical_export_normalizes_retired_headings_and_preserves_evidence(
+    prepared_store, tmp_path: Path
+) -> None:
+    store, _, dataset_id = prepared_store
+    item = store.get_next_item(dataset_id)
+    assert item is not None
+    service = ReviewService(store, FakeOllamaClient())
+    snapshot = service.generate_pair(item, "checking bills twice")
+    service.save_decision(
+        item=item,
+        decision="prefer_a",
+        idempotency_key=decision_idempotency_key(item.id, "prefer_a", snapshot.id),
+    )
+    with store.transaction() as connection:
+        connection.execute(
+            "UPDATE generation_snapshots SET category_version = 'hitl_code_categories_v1' WHERE id = ?",
+            (snapshot.id,),
+        )
+        candidates = connection.execute(
+            "SELECT id, rendered_text FROM candidates WHERE snapshot_id = ?",
+            (snapshot.id,),
+        ).fetchall()
+        for candidate in candidates:
+            historical = str(candidate["rendered_text"]).replace(
+                "Evidence quote:",
+                "Code label: checking bills twice\nActual segment quote:",
+            )
+            historical += "\nCategory boundary: Retired historical explanation"
+            connection.execute(
+                "UPDATE candidates SET rendered_text = ?, rendered_sha256 = ? WHERE id = ?",
+                (
+                    historical,
+                    hashlib.sha256(historical.encode("utf-8")).hexdigest(),
+                    candidate["id"],
+                ),
+            )
+    exporter = PreferenceExporter(
+        store,
+        tmp_path / "historical-exports",
+        clock=lambda: datetime(2026, 8, 5, 13, 0, tzinfo=timezone.utc),
+    )
+    result = exporter.export(dataset_id)
+    row = json.loads(result.jsonl_path.read_text(encoding="utf-8").splitlines()[0])
+    for side in ("chosen", "rejected"):
+        content = row[side][0]["content"]
+        assert "Evidence quote: I checked the bill twice." in content
+        assert "Actual segment quote:" not in content
+        assert "Code label:" not in content
+        assert "Category boundary:" not in content
 
 
 @pytest.mark.parametrize(
@@ -175,7 +228,9 @@ def test_invalid_candidate_is_audited_and_excluded_without_live_ollama(
     assert preview.exclusion_counts == {"invalid_candidate": 1}
 
 
-def test_research_question_edits_supersede_but_do_not_mutate_snapshot(prepared_store) -> None:
+def test_research_question_edits_preserve_history_until_replacement_completes(
+    prepared_store,
+) -> None:
     store, study_id, dataset_id = prepared_store
     item = store.get_next_item(dataset_id)
     assert item is not None
@@ -191,22 +246,132 @@ def test_research_question_edits_supersede_but_do_not_mutate_snapshot(prepared_s
     historical = service.load_snapshot(snapshot.id)
     assert historical.status == "superseded"
     assert historical.questions[0].text == old_text
+    replacement = ReviewService(store, FakeOllamaClient()).generate_pair(
+        item, "checking bills twice"
+    )
+    assert replacement.status == "ready"
+    assert replacement.questions[0].text == "How does uncertainty shape repeated checking?"
+    with pytest.raises(KeyError, match="Unknown snapshot"):
+        service.load_snapshot(snapshot.id)
 
 
-def test_three_attempt_cap_and_code_change_supersession(prepared_store) -> None:
+def test_more_than_three_explicit_regenerations_replace_the_previous_pair(prepared_store) -> None:
     store, _, dataset_id = prepared_store
     item = store.get_next_item(dataset_id)
     assert item is not None
-    fake = FakeOllamaClient([valid_candidate(), valid_candidate("too_broad")] * 3)
-    service = ReviewService(store, fake, maximum_pair_attempts=3)
-    first = service.generate_pair(item, "code one")
-    second = service.generate_pair(item, "code two")
-    third = service.generate_pair(item, "code three")
-    assert service.load_snapshot(first.id).status == "superseded"
-    assert service.load_snapshot(second.id).status == "superseded"
-    assert third.status == "ready"
-    with pytest.raises(ValueError, match="limit of 3"):
-        service.generate_pair(item, "code four")
+    fake = FakeOllamaClient([valid_candidate(), valid_candidate("too_broad")] * 6)
+    service = ReviewService(store, fake)
+    current = service.generate_pair(item, "code 0")
+    retired_ids: list[int] = []
+    for attempt in range(1, 6):
+        retired_ids.append(current.id)
+        prior_seeds = _snapshot_seeds(store, current.id)
+        current = service.generate_pair(
+            item,
+            f"code {attempt}",
+            replace_snapshot_id=current.id,
+        )
+        assert current.status == "ready"
+        assert _snapshot_seeds(store, current.id) != prior_seeds
+    assert current.attempt_number == 6
+    assert len(fake.calls) == 12
+    with store.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM generation_snapshots").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM candidate_calls").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM snapshot_context").fetchone()[0] > 0
+        assert connection.execute("SELECT COUNT(*) FROM snapshot_questions").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM ab_assignments").fetchone()[0] == 2
+    for snapshot_id in retired_ids:
+        with pytest.raises(KeyError, match="Unknown snapshot"):
+            service.load_snapshot(snapshot_id)
+
+
+def test_regeneration_double_submit_returns_the_same_replacement(prepared_store) -> None:
+    store, _, dataset_id = prepared_store
+    item = store.get_next_item(dataset_id)
+    assert item is not None
+    fake = FakeOllamaClient([valid_candidate(), valid_candidate("too_broad")] * 2)
+    service = ReviewService(store, fake)
+    original = service.generate_pair(item, "code")
+    replacement = service.generate_pair(item, "code", replace_snapshot_id=original.id)
+    repeated = service.generate_pair(item, "code", replace_snapshot_id=original.id)
+    assert repeated.id == replacement.id
+    assert len(fake.calls) == 4
+    assert [
+        (candidate.display_label, candidate.candidate_number)
+        for candidate in repeated.candidates
+    ] == [
+        (candidate.display_label, candidate.candidate_number)
+        for candidate in replacement.candidates
+    ]
+
+
+def test_failed_regeneration_keeps_old_pair_until_resumed_replacement_completes(
+    prepared_store,
+) -> None:
+    store, _, dataset_id = prepared_store
+    item = store.get_next_item(dataset_id)
+    assert item is not None
+    original = ReviewService(store, FakeOllamaClient()).generate_pair(item, "code")
+    interrupted = ReviewService(
+        store,
+        FakeOllamaClient([valid_candidate(), OllamaConnectionError("offline")]),
+    )
+    with pytest.raises(OllamaConnectionError):
+        interrupted.generate_pair(item, "replacement code", replace_snapshot_id=original.id)
+    with store.connection() as connection:
+        rows = connection.execute(
+            "SELECT id, status FROM generation_snapshots ORDER BY attempt_number"
+        ).fetchall()
+    assert [(row["id"], row["status"]) for row in rows] == [
+        (original.id, "superseded"),
+        (rows[1]["id"], "generating"),
+    ]
+    resumed = ReviewService(store, FakeOllamaClient([valid_candidate("too_broad")]))
+    replacement = resumed.generate_pair(item, "replacement code")
+    assert replacement.status == "ready"
+    with pytest.raises(KeyError, match="Unknown snapshot"):
+        resumed.load_snapshot(original.id)
+    with store.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM generation_snapshots").fetchone()[0] == 1
+
+
+def test_invalid_replacement_keeps_prior_pair_for_audit(prepared_store) -> None:
+    store, _, dataset_id = prepared_store
+    item = store.get_next_item(dataset_id)
+    assert item is not None
+    original = ReviewService(store, FakeOllamaClient()).generate_pair(item, "code")
+    invalid_client = FakeOllamaClient([{}, {}, {}, {}])
+    replacement = ReviewService(store, invalid_client).generate_pair(
+        item,
+        "replacement code",
+        replace_snapshot_id=original.id,
+    )
+    assert replacement.status == "invalid"
+    with store.connection() as connection:
+        rows = connection.execute(
+            "SELECT id, status FROM generation_snapshots ORDER BY attempt_number"
+        ).fetchall()
+    assert [(row["id"], row["status"]) for row in rows] == [
+        (original.id, "superseded"),
+        (replacement.id, "invalid"),
+    ]
+
+
+def test_regeneration_is_prohibited_after_an_immutable_decision(prepared_store) -> None:
+    store, _, dataset_id = prepared_store
+    item = store.get_next_item(dataset_id)
+    assert item is not None
+    service = ReviewService(store, FakeOllamaClient())
+    snapshot = service.generate_pair(item, "code")
+    service.save_decision(
+        item=item,
+        decision="prefer_a",
+        idempotency_key=decision_idempotency_key(item.id, "prefer_a", snapshot.id),
+    )
+    with pytest.raises(ValueError, match="immutable decision"):
+        service.generate_pair(item, "new code", replace_snapshot_id=snapshot.id)
 
 
 def test_pre_generation_skip_is_final_and_excluded(prepared_store, tmp_path: Path) -> None:
@@ -279,3 +444,13 @@ def test_schema_migration_and_foreign_keys_are_enabled(prepared_store) -> None:
     with store.connection() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def _snapshot_seeds(store, snapshot_id: int) -> tuple[int, int]:
+    with store.connection() as connection:
+        row = connection.execute(
+            "SELECT seed_1, seed_2 FROM generation_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+    assert row is not None
+    return int(row["seed_1"]), int(row["seed_2"])

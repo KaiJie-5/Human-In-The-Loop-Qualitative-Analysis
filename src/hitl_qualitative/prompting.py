@@ -10,7 +10,7 @@ from .categories import CATEGORY_CONTRACT_VERSION, CATEGORY_SPECS
 from .transcripts import TranscriptTurn
 
 
-PROMPT_VERSION = "hitl_code_assessment_v2"
+PROMPT_VERSION = "hitl_code_assessment_v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +54,10 @@ def build_prompt(
         "- The Target segment is the primary and only evidence for the coding decision.\n"
         "- Previous and next transcript turns may clarify language, sequence, or ambiguity, "
         "but do not present text from those turns as evidence for the target segment.\n"
-        "- Ground every rationale in the Target segment. Do not include direct quotations in "
-        "the response and do not invent, paraphrase as a quotation, splice, or use text from "
-        "another turn as target evidence.\n\n"
+        "- Return one evidence_quote taken from the Target segment. Do not invent, paraphrase, "
+        "splice, or use text from another turn as target evidence.\n"
+        "- The application records evidence_quote exactly as returned; carefully verify the "
+        "quote against the Target segment before responding.\n\n"
         "TASK\n"
         "Assess the exact researcher-supplied code shown below. Do not replace, rewrite, or "
         "repeat the code label in your JSON. Classify the coding decision using exactly one "
