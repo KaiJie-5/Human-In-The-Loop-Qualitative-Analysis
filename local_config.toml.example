@@ -1,0 +1,18 @@
+[paths]
+database = "runtime/hitl.sqlite3"
+exports = "exports"
+
+[ollama]
+base_url = "http://localhost:11434"
+health_timeout_seconds = 5
+generation_timeout_seconds = 900
+
+[review]
+default_context_before = 20
+default_context_after = 20
+maximum_context_turns = 100
+temperature = 0.4
+top_p = 0.9
+output_tokens = 5000
+context_tokens = 65536
+maximum_pair_attempts = 3
