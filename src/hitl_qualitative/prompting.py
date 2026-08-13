@@ -10,7 +10,7 @@ from .categories import CATEGORY_CONTRACT_VERSION, CATEGORY_SPECS
 from .transcripts import TranscriptTurn
 
 
-PROMPT_VERSION = "hitl_code_assessment_v3"
+PROMPT_VERSION = "hitl_code_assessment_v4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,18 +54,14 @@ def build_prompt(
         "- The Target segment is the primary and only evidence for the coding decision.\n"
         "- Previous and next transcript turns may clarify language, sequence, or ambiguity, "
         "but do not present text from those turns as evidence for the target segment.\n"
-        "- Return one evidence_quote taken from the Target segment. Do not invent, paraphrase, "
-        "splice, or use text from another turn as target evidence.\n"
-        "- The application records evidence_quote exactly as returned; carefully verify the "
-        "quote against the Target segment before responding.\n\n"
+        "- Do not invent quotations or rely on another turn as evidence for the target.\n\n"
         "TASK\n"
         "Assess the exact researcher-supplied code shown below. Do not replace, rewrite, or "
-        "repeat the code label in your JSON. Classify the coding decision using exactly one "
-        "category, connect the assessment specifically to the selected research questions, "
-        "and produce one specific open-ended reflective question for the qualitative "
+        "repeat the code label in your JSON. Use the target evidence and selected research "
+        "questions to classify the coding decision using exactly one category, then produce "
+        "one specific open-ended reflective question for the qualitative "
         "researcher. The question must not be yes/no and must not merely ask whether the "
-        "category is correct. A separate alternative interpretation may be discussed only "
-        "inside an appropriate rationale field.\n\n"
+        "category is correct.\n\n"
         f"CATEGORY CONTRACT ({CATEGORY_CONTRACT_VERSION})\n{categories}\n\n"
         f"SELECTED RESEARCH QUESTIONS\n{question_text}\n\n"
         f"PREVIOUS CONTEXT (clarification only)\n{_render_turns(previous)}\n\n"
@@ -109,7 +105,7 @@ def build_repair_prompt(
         f"{original_prompt}\n\n"
         "REPAIR REQUEST\n"
         "The prior response below failed validation. Return a complete replacement JSON "
-        "object, correcting only the listed problems. Do not invent missing evidence.\n"
+        "object, correcting only the listed problems and adding no fields outside the schema.\n"
         f"Validation errors:\n{listed}\n"
         f"Prior response:\n{invalid_content}"
     )

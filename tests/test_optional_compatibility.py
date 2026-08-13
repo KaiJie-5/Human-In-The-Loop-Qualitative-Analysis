@@ -33,9 +33,12 @@ def test_first_twenty_real_rows_include_all_heading_contracts() -> None:
     path_value = os.environ.get("DPO_REFERENCE_JSONL")
     if not path_value:
         pytest.skip("Set DPO_REFERENCE_JSONL to preference_pairs_category_evidence.jsonl.")
+    path = Path(path_value)
+    if not path.is_file():
+        pytest.skip(f"Configured DPO_REFERENCE_JSONL is not accessible: {path}")
     categories: set[str] = set()
     inspected = 0
-    with Path(path_value).open("r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
@@ -55,4 +58,3 @@ def test_first_twenty_real_rows_include_all_heading_contracts() -> None:
         "Too broad code",
         "Useful analytical code",
     }
-

@@ -2,126 +2,112 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Mapping, Union
+from typing import Any, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
-from .categories import CATEGORY_BY_ID
+from .categories import CATEGORY_BY_ID, CategoryId
 
 
-class _StrictAssessment(BaseModel):
+class CandidateAssessment(BaseModel):
+    """Version-4 model-controlled response contract."""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
 
-    @field_validator("*", mode="after")
+    category_id: CategoryId
+    reflective_question: str
+
+    @field_validator("reflective_question", mode="after")
     @classmethod
-    def require_nonempty_strings(cls, value: Any) -> Any:
-        if isinstance(value, str) and not value.strip():
-            raise ValueError("Text fields must not be empty.")
+    def require_nonempty_reflection(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Reflective question must not be empty.")
         return value
 
-
-class WrongCodeAssessment(_StrictAssessment):
-    category_id: Literal["wrong_code"]
-    evidence_quote: str
-    why_plausible_for_wider_dataset: str
-    why_unsupported_by_this_segment: str
-    relation_to_research_questions: str
-    reflective_question: str
-
-
-class DescriptiveAssessment(_StrictAssessment):
-    category_id: Literal["descriptive_not_answering_rq"]
-    evidence_quote: str
-    surface_description: str
-    why_true_of_segment: str
-    why_not_useful_for_research_questions: str
-    relation_to_research_questions: str
-    reflective_question: str
-
-
-class TooBroadAssessment(_StrictAssessment):
-    category_id: Literal["too_broad"]
-    evidence_quote: str
-    broad_relevance_to_research_questions: str
-    specific_meaning_lost: str
-    why_it_is_too_broad: str
-    relation_to_research_questions: str
-    reflective_question: str
-
-
-class UsefulAssessment(_StrictAssessment):
-    category_id: Literal["useful_analytical_code"]
-    evidence_quote: str
-    specific_analytical_insight: str
-    why_it_is_useful: str
-    relation_to_research_questions: str
-    reflective_question: str
-
-
-CandidateAssessment = Annotated[
-    Union[
-        WrongCodeAssessment,
-        DescriptiveAssessment,
-        TooBroadAssessment,
-        UsefulAssessment,
-    ],
-    Field(discriminator="category_id"),
-]
-CANDIDATE_ADAPTER = TypeAdapter(CandidateAssessment)
 
 @dataclass(frozen=True, slots=True)
 class ResponseSection:
     label: str
     value: str
-    is_evidence: bool = False
 
 
 def candidate_json_schema() -> dict[str, Any]:
-    return CANDIDATE_ADAPTER.json_schema()
+    return CandidateAssessment.model_json_schema()
 
 
 def parse_candidate(raw_content: str) -> CandidateAssessment:
-    return CANDIDATE_ADAPTER.validate_json(raw_content)
+    return CandidateAssessment.model_validate_json(raw_content)
 
 
-def render_candidate(candidate: CandidateAssessment) -> str:
-    return "\n".join(
-        f"{section.label}: {section.value}"
-        for section in response_sections(candidate.model_dump())
+def render_response(category_id: str, reflective_question: str) -> str:
+    spec = CATEGORY_BY_ID.get(category_id)  # type: ignore[arg-type]
+    if spec is None:
+        raise ValueError(f"Unsupported category ID {category_id!r}.")
+    if not reflective_question.strip():
+        raise ValueError("Reflective question must not be empty.")
+    return (
+        f"Code category: {spec.display_label}\n"
+        f"Reflective question: {reflective_question}"
     )
 
 
-def response_sections(payload: Mapping[str, Any]) -> tuple[ResponseSection, ...]:
-    """Return ordered display/export sections for current and historical candidates."""
-    category_id = str(payload.get("category_id", ""))
+def render_candidate(candidate: CandidateAssessment) -> str:
+    return render_response(candidate.category_id, candidate.reflective_question)
+
+
+def response_sections(
+    payload: Mapping[str, Any],
+    *,
+    effective_category_id: str | None = None,
+) -> tuple[ResponseSection, ...]:
+    category_id = effective_category_id or str(payload.get("category_id", ""))
     spec = CATEGORY_BY_ID.get(category_id)  # type: ignore[arg-type]
-    if spec is None:
+    reflection = payload.get("reflective_question")
+    if spec is None or reflection is None or not str(reflection).strip():
         return ()
-    sections = [ResponseSection("Code category", spec.display_label)]
-    evidence = payload.get("evidence_quote")
-    if evidence is None:
-        evidence = payload.get("actual_segment_quote")
-    if evidence is not None and str(evidence).strip():
-        sections.append(ResponseSection("Evidence quote", str(evidence), is_evidence=True))
-    for field, heading in spec.rendered_fields:
-        if field == "evidence_quote":
-            continue
-        value = payload.get(field)
-        if value is not None and str(value).strip():
-            sections.append(ResponseSection(heading, str(value)))
-    return tuple(sections)
+    return (
+        ResponseSection("Code category", spec.display_label),
+        ResponseSection("Reflective question", str(reflection)),
+    )
+
+
+def historical_candidate_fields(
+    parsed: Mapping[str, Any] | None,
+    rendered_text: str | None,
+) -> tuple[str, str] | None:
+    """Extract the two v4 fields without modifying a historical audit record."""
+    parsed = parsed or {}
+    category_id = str(parsed.get("category_id") or "")
+    reflection = str(parsed.get("reflective_question") or "")
+    if category_id in CATEGORY_BY_ID and reflection.strip():
+        return category_id, reflection
+
+    category_label = ""
+    reflection_lines: list[str] = []
+    collecting_reflection = False
+    for line in str(rendered_text or "").splitlines():
+        if line.startswith("Code category:"):
+            category_label = line.split(":", 1)[1].strip()
+            collecting_reflection = False
+        elif line.startswith("Reflective question:"):
+            reflection_lines = [line.split(":", 1)[1].lstrip()]
+            collecting_reflection = True
+        elif collecting_reflection:
+            reflection_lines.append(line)
+    if category_id not in CATEGORY_BY_ID:
+        category_id = next(
+            (spec.id for spec in CATEGORY_BY_ID.values() if spec.display_label == category_label),
+            "",
+        )
+    reflection = "\n".join(reflection_lines).strip()
+    if category_id in CATEGORY_BY_ID and reflection:
+        return category_id, reflection
+    return None
 
 
 def normalize_response_text(rendered_text: str) -> str:
-    """Normalize retired headings without rewriting immutable historical records."""
-    normalized: list[str] = []
-    for line in rendered_text.splitlines():
-        if line.startswith(("Code label:", "Category boundary:")):
-            continue
-        if line.startswith("Actual segment quote:"):
-            line = "Evidence quote:" + line.removeprefix("Actual segment quote:")
-        normalized.append(line)
-    return "\n".join(normalized)
+    fields = historical_candidate_fields(None, rendered_text)
+    return render_response(*fields) if fields else ""
 
 
 def candidate_to_json(candidate: CandidateAssessment) -> str:

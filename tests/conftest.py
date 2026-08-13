@@ -34,39 +34,11 @@ def segment_payload(*, transcript_id: str = "INT001", record_id: str = "INT001_S
 
 
 def valid_candidate(category: str = "useful_analytical_code") -> dict[str, Any]:
-    common = {
-        "evidence_quote": "I checked the bill twice.",
-        "relation_to_research_questions": "It advances the question about how people handle unclear bills.",
-        "reflective_question": "How does checking twice illuminate the participant's response to uncertainty?",
-    }
-    if category == "wrong_code":
-        return {
-            "category_id": category,
-            "why_plausible_for_wider_dataset": "Other participants may ignore their bills.",
-            "why_unsupported_by_this_segment": "This participant explicitly describes checking.",
-            **common,
-        }
-    if category == "descriptive_not_answering_rq":
-        return {
-            "category_id": category,
-            "surface_description": "The participant mentions a bill.",
-            "why_true_of_segment": "The word bill occurs in the target.",
-            "why_not_useful_for_research_questions": "Mention alone does not explain an interaction.",
-            **common,
-        }
-    if category == "too_broad":
-        return {
-            "category_id": category,
-            "broad_relevance_to_research_questions": "It concerns an interaction with billing.",
-            "specific_meaning_lost": "It loses the repeated checking caused by uncertainty.",
-            "why_it_is_too_broad": "The label does not preserve the checking strategy.",
-            **common,
-        }
     return {
-        "category_id": "useful_analytical_code",
-        "specific_analytical_insight": "Repeated checking is a response to billing uncertainty.",
-        "why_it_is_useful": "It links a concrete action to the participant's uncertainty.",
-        **common,
+        "category_id": category,
+        "reflective_question": (
+            "How does checking twice illuminate the participant's response to uncertainty?"
+        ),
     }
 
 
@@ -139,8 +111,9 @@ def prepared_store(tmp_path: Path) -> tuple[SQLiteStore, int, int]:
     )
     data = (json.dumps(segment_payload(), ensure_ascii=False) + "\n").encode("utf-8")
     bundle = TranscriptAdapter().from_upload("segments.jsonl", data)
-    dataset_id, created = store.import_dataset(
-        study_id=study_id, name="Dataset", split="adaptation", source_kind="upload", bundle=bundle
+    dataset_id, created = store.import_adaptation_dataset(
+        study_id=study_id, name="Dataset", source_kind="upload", bundle=bundle
     )
     assert created
+    assert store.get_dataset(dataset_id)["split"] == "adaptation"
     return store, study_id, dataset_id

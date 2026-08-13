@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .candidates import normalize_response_text, parse_candidate, render_candidate
+from .candidates import historical_candidate_fields, render_response
 from .categories import CATEGORY_CONTRACT_VERSION
 from .database import SQLiteStore, utc_now
 
@@ -182,9 +182,9 @@ class PreferenceExporter:
         with self.store.connection() as connection:
             items = connection.execute(
                 """
-                SELECT ri.id AS item_id, ri.source_order, d.id AS decision_id,
-                       d.decision, d.snapshot_id, d.preferred_candidate_id, d.reviewer_id
-                FROM review_items ri LEFT JOIN decisions d ON d.review_item_id = ri.id
+                SELECT ri.id AS item_id, ri.source_order, sc.outcome
+                FROM review_items ri
+                LEFT JOIN segment_completions sc ON sc.review_item_id = ri.id
                 WHERE ri.dataset_id = ? ORDER BY ri.source_order
                 """,
                 (dataset_id,),
@@ -192,70 +192,107 @@ class PreferenceExporter:
             if dataset["split"] != "adaptation":
                 return [], {"non_adaptation_split": len(items)}
             for item in items:
-                if item["decision_id"] is None:
-                    latest = connection.execute(
-                        """
-                        SELECT status FROM generation_snapshots
-                        WHERE review_item_id = ? ORDER BY attempt_number DESC LIMIT 1
-                        """,
-                        (item["item_id"],),
-                    ).fetchone()
-                    if latest is not None and latest["status"] == "invalid":
-                        _increment(exclusions, "invalid_candidate")
-                    elif latest is not None and latest["status"] == "superseded":
-                        _increment(exclusions, "superseded_snapshot")
-                    else:
-                        _increment(exclusions, "no_decision")
+                if item["outcome"] == "skipped":
+                    _increment(exclusions, "segment_skip")
                     continue
-                decision = str(item["decision"])
-                if decision not in {"prefer_a", "prefer_b"}:
-                    _increment(exclusions, decision)
-                    continue
-                snapshot = connection.execute(
-                    "SELECT * FROM generation_snapshots WHERE id = ?", (item["snapshot_id"],)
-                ).fetchone()
-                if snapshot is None or snapshot["status"] != "ready" or snapshot["superseded_by"]:
-                    _increment(exclusions, "invalid_or_superseded_snapshot")
-                    continue
-                if hashlib.sha256(snapshot["exact_prompt"].encode("utf-8")).hexdigest() != snapshot["prompt_sha256"]:
-                    _increment(exclusions, "unstable_prompt")
-                    continue
-                identity = (int(item["item_id"]), str(item["reviewer_id"]), str(snapshot["prompt_sha256"]))
-                if identity in seen:
-                    _increment(exclusions, "duplicate_identity")
-                    continue
-                candidate_rows = connection.execute(
-                    "SELECT * FROM candidates WHERE snapshot_id = ? ORDER BY candidate_number",
-                    (snapshot["id"],),
+                code_rows = connection.execute(
+                    """
+                    SELECT cr.id AS code_review_id, cr.status AS code_status,
+                           cd.id AS decision_id, cd.decision, cd.snapshot_id,
+                           cd.preferred_candidate_id, cd.reviewer_id
+                    FROM code_reviews cr
+                    LEFT JOIN code_decisions cd ON cd.code_review_id = cr.id
+                    WHERE cr.review_item_id = ? AND cr.status <> 'abandoned'
+                    ORDER BY cr.ordinal
+                    """,
+                    (item["item_id"],),
                 ).fetchall()
-                if len(candidate_rows) != 2 or any(
-                    not candidate["valid"] or not candidate["rendered_text"]
-                    for candidate in candidate_rows
-                ):
-                    _increment(exclusions, "invalid_candidate")
+                if not code_rows:
+                    _increment(exclusions, "no_code_review")
                     continue
-                if any(
-                    not _stable_rendering(candidate, str(snapshot["category_version"]))
-                    for candidate in candidate_rows
-                ):
-                    _increment(exclusions, "unstable_code_or_rendering")
-                    continue
-                chosen = next(
-                    (candidate for candidate in candidate_rows if candidate["id"] == item["preferred_candidate_id"]),
-                    None,
-                )
-                if chosen is None:
-                    _increment(exclusions, "invalid_display_mapping")
-                    continue
-                rejected = next(candidate for candidate in candidate_rows if candidate["id"] != chosen["id"])
-                rows.append(
-                    ExportMapper.row(
-                        str(snapshot["exact_prompt"]),
-                        normalize_response_text(str(chosen["rendered_text"])),
-                        normalize_response_text(str(rejected["rendered_text"])),
+                for code in code_rows:
+                    if code["decision_id"] is None:
+                        reason = (
+                            "invalid_candidate" if code["code_status"] == "invalid"
+                            else "no_decision"
+                        )
+                        _increment(exclusions, reason)
+                        continue
+                    decision = str(code["decision"])
+                    if decision not in {"prefer_a", "prefer_b"}:
+                        _increment(exclusions, decision)
+                        continue
+                    snapshot = connection.execute(
+                        "SELECT * FROM generation_snapshots WHERE id = ?", (code["snapshot_id"],)
+                    ).fetchone()
+                    if (
+                        snapshot is None
+                        or snapshot["status"] != "ready"
+                        or snapshot["superseded_by"]
+                    ):
+                        _increment(exclusions, "invalid_or_superseded_snapshot")
+                        continue
+                    if (
+                        hashlib.sha256(snapshot["exact_prompt"].encode("utf-8")).hexdigest()
+                        != snapshot["prompt_sha256"]
+                    ):
+                        _increment(exclusions, "unstable_prompt")
+                        continue
+                    identity = (
+                        int(code["code_review_id"]),
+                        str(code["reviewer_id"]),
+                        str(snapshot["prompt_sha256"]),
                     )
-                )
-                seen.add(identity)
+                    if identity in seen:
+                        _increment(exclusions, "duplicate_identity")
+                        continue
+                    candidate_rows = connection.execute(
+                        """
+                        SELECT c.*, ab.display_label, cdc.category_id AS effective_category_id
+                        FROM candidates c
+                        JOIN ab_assignments ab
+                          ON ab.candidate_id = c.id AND ab.snapshot_id = c.snapshot_id
+                        LEFT JOIN code_decision_categories cdc
+                          ON cdc.decision_id = ? AND cdc.candidate_id = c.id
+                        WHERE c.snapshot_id = ? ORDER BY ab.display_label
+                        """,
+                        (code["decision_id"], snapshot["id"]),
+                    ).fetchall()
+                    if len(candidate_rows) != 2 or any(
+                        not candidate["valid"] or not candidate["rendered_text"]
+                        for candidate in candidate_rows
+                    ):
+                        _increment(exclusions, "invalid_candidate")
+                        continue
+                    rendered: dict[int, str] = {}
+                    stable = True
+                    for candidate in candidate_rows:
+                        fields = _stable_candidate_fields(
+                            candidate, str(snapshot["category_version"])
+                        )
+                        category_id = candidate["effective_category_id"]
+                        if fields is None or not category_id:
+                            stable = False
+                            break
+                        rendered[int(candidate["id"])] = render_response(
+                            str(category_id), fields[1]
+                        )
+                    if not stable:
+                        _increment(exclusions, "unstable_code_or_rendering")
+                        continue
+                    chosen_id = int(code["preferred_candidate_id"])
+                    if chosen_id not in rendered:
+                        _increment(exclusions, "invalid_display_mapping")
+                        continue
+                    rejected_id = next(value for value in rendered if value != chosen_id)
+                    rows.append(
+                        ExportMapper.row(
+                            str(snapshot["exact_prompt"]),
+                            rendered[chosen_id],
+                            rendered[rejected_id],
+                        )
+                    )
+                    seen.add(identity)
         return rows, dict(sorted(exclusions.items()))
 
 
@@ -263,21 +300,23 @@ def _increment(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
-def _stable_rendering(candidate: Any, category_version: str) -> bool:
+def _stable_candidate_fields(
+    candidate: Any, category_version: str
+) -> tuple[str, str] | None:
     text = str(candidate["rendered_text"] or "")
     hash_is_stable = bool(
         candidate["rendered_sha256"]
         and hashlib.sha256(text.encode("utf-8")).hexdigest() == candidate["rendered_sha256"]
     )
     if not hash_is_stable:
-        return False
-    if category_version != CATEGORY_CONTRACT_VERSION:
-        # Historical candidates were validated under their saved contract. Preserve the
-        # immutable audit record, but strip its retired display/export lines at the boundary.
-        return bool(normalize_response_text(text).strip())
+        return None
     try:
-        parsed = parse_candidate(str(candidate["parsed_json"] or ""))
-        expected = render_candidate(parsed)
+        parsed = json.loads(str(candidate["parsed_json"] or "{}"))
     except Exception:
-        return False
-    return text == expected
+        parsed = None
+    fields = historical_candidate_fields(parsed if isinstance(parsed, dict) else None, text)
+    if fields is None:
+        return None
+    if category_version == CATEGORY_CONTRACT_VERSION and text != render_response(*fields):
+        return None
+    return fields

@@ -1,18 +1,31 @@
 # Human-in-the-Loop Qualitative Analysis
 
-A local research application for producing researcher-reviewed preference data for qualitative coding. The application combines Streamlit, Ollama, and SQLite to present interview context, generate two blinded assessments of a researcher-supplied qualitative code, record a preference decision, and export eligible preference pairs for further DPO training.
+A local research application for producing researcher-reviewed preference data for qualitative coding. The application combines Streamlit, Ollama, and SQLite to present interview context, review multiple researcher-supplied codes for each target segment, generate blinded model responses, autosave reviewer drafts, and export eligible preference pairs for further DPO training.
 
 This repository is extension work based on [KaiJie-5/Direct-Preference-Optimization-of-LLMs-for-Critical-Thinking](https://github.com/KaiJie-5/Direct-Preference-Optimization-of-LLMs-for-Critical-Thinking). Refer to that upstream repository for information about preparing data, training a DPO model, and the original DPO pipeline. This repository begins after training and focuses on local human review and preference-data collection.
 
 The application runs locally and has three pages:
 
-- **Setup:** configure a study, reviewer, research questions, transcript dataset, context window, and Ollama model.
-- **Review:** assess transcript segments, generate two blinded model responses, and record a preference or audit decision.
-- **Progress and export:** monitor completion and export eligible `adaptation` preference pairs as chat JSONL.
+- **Setup:** initialize the local reviewer, configure research questions, import transcript data, set the context window, and select an Ollama model.
+- **Review:** keep the target segment and research questions pinned, add multiple qualitative codes, generate two blinded responses per code, correct categories, and autosave preference drafts.
+- **Progress and export:** monitor both segment and code-review completion and export eligible preference pairs as chat JSONL.
 
-Candidate assessments are shown as structured cards. Each explicit regeneration uses two new
-seeds and replaces the prior pair only after the replacement finishes successfully; saved
-decisions remain immutable.
+The application uses one hidden local study record to own durable settings and audit history. A
+fresh database asks only for a staff/student ID; it does not require study creation or selection.
+Every new dataset import is classified as `adaptation`, so a finalized Prefer A/B code review can
+become eligible for another DPO round. Historical validation and test datasets remain blocked
+from training export.
+
+Each candidate contains exactly two fields: **Code category** and **Reflective question**. The
+reviewer may correct A's and B's categories independently; the original model categories remain
+in SQLite for audit while the reviewer-confirmed categories are used for display and export.
+Draft choices, reasons, and tags are saved automatically. **Finish segment and next** makes all
+code decisions for that segment immutable in one transaction.
+
+Generation is sequential and resumable: each code uses two independent seeds with otherwise
+identical requests. A code label locks when generation starts, but more codes may be added before
+the segment is finalized. Regeneration replaces only the selected code pair after a successful
+replacement and remains unlimited before finalization.
 
 ## Getting Started
 

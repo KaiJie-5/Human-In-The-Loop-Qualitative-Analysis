@@ -2,45 +2,54 @@ from __future__ import annotations
 
 import html
 import json
-import secrets
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
-from .candidates import ResponseSection, normalize_response_text, response_sections
-from .categories import CATEGORY_CONTRACT_VERSION, CATEGORY_SPECS
+from .candidates import ResponseSection, historical_candidate_fields, response_sections
+from .categories import CATEGORY_BY_ID, CATEGORY_SPECS
 from .config import AppConfig, load_config
 from .database import QuestionDraft, SQLiteStore
 from .exporting import PreferenceExporter
 from .ollama_client import HttpOllamaClient, OllamaError
 from .transcripts import TranscriptAdapter, TranscriptTurn, select_context
-from .workflow import ISSUE_TAGS, ReviewService, decision_idempotency_key
+from .workflow import ISSUE_TAGS, CodeReviewView, ReviewService, segment_idempotency_key
+
+
+DECISION_LABELS = {
+    "Choose a decision…": None,
+    "Prefer A": "prefer_a",
+    "Prefer B": "prefer_b",
+    "Both poor": "both_poor",
+    "Too similar": "too_similar",
+    "Skip": "skip",
+}
+DECISION_BY_VALUE = {value: label for label, value in DECISION_LABELS.items()}
 
 
 def setup_page() -> None:
-    st.title("Study setup")
-    st.caption("Configure a local study, its transcript data, research questions, and Ollama model.")
+    st.title("Setup")
+    st.caption("Configure the local reviewer, Ollama model, research questions, and transcript data.")
     config, store = _environment()
-
-    studies = store.list_studies()
-    with st.expander("Create a new study", expanded=not studies):
-        with st.form("create_study"):
-            name = st.text_input("Study name")
-            reviewer = st.text_input(
-                "Reviewer ID (staff or student ID)",
-                help=(
-                    "Enter your institutional staff/student ID or a study-specific "
-                    "pseudonym. It is stored only in the local SQLite database and "
-                    "omitted from exports."
-                ),
-            )
-            create = st.form_submit_button("Create study", type="primary")
-        if create:
+    try:
+        study = store.get_singleton_study()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+    if study is None:
+        st.subheader("Initialize local review")
+        st.caption(
+            "Enter the staff or student ID used to recover your local review progress. "
+            "It remains in SQLite and is never included in DPO exports."
+        )
+        with st.form("initialize_singleton"):
+            reviewer_id = st.text_input("Staff or student ID")
+            initialize = st.form_submit_button("Continue", type="primary")
+        if initialize:
             try:
-                study_id = store.create_study(
-                    name=name,
-                    reviewer_id=reviewer,
+                store.create_singleton_study(
+                    reviewer_id=reviewer_id,
                     ollama_base_url=config.ollama_base_url,
                     context_before=config.default_context_before,
                     context_after=config.default_context_after,
@@ -49,29 +58,21 @@ def setup_page() -> None:
                     output_tokens=config.output_tokens,
                     context_tokens=config.context_tokens,
                 )
-                st.session_state.active_study_id = study_id
-                st.success("Study created.")
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
-
-    studies = store.list_studies()
-    if not studies:
-        st.info("Create a study to continue.")
         return
-    study_labels = {int(value["id"]): str(value["name"]) for value in studies}
-    default_study = int(st.session_state.get("active_study_id", studies[0]["id"]))
-    if default_study not in study_labels:
-        default_study = next(iter(study_labels))
-    study_id = st.selectbox(
-        "Current study",
-        options=list(study_labels),
-        format_func=study_labels.get,
-        index=list(study_labels).index(default_study),
-    )
-    st.session_state.active_study_id = study_id
-    study = store.get_study(study_id)
 
+    study_id = int(study["id"])
+    _model_and_context_setup(config, store, study)
+    _research_question_setup(store, study_id)
+    _dataset_setup(store, study_id)
+
+
+def _model_and_context_setup(
+    config: AppConfig, store: SQLiteStore, study: dict[str, Any]
+) -> None:
+    study_id = int(study["id"])
     st.subheader("Reviewer, model, and context")
     base_url = st.text_input(
         "Ollama base URL", value=str(study["ollama_base_url"]), key=f"base_url_{study_id}"
@@ -91,17 +92,20 @@ def setup_page() -> None:
             st.session_state.pop(f"model_list_{study_id}", None)
             st.error(str(exc))
     discovered = st.session_state.get(f"model_list_{study_id}", [])
-    discovered_names = [item["name"] for item in discovered]
+    discovered_names = [entry["name"] for entry in discovered]
     if discovered_names:
-        initial_model = study.get("model_name")
-        model_name = st.selectbox(
+        initial = study.get("model_name")
+        options = discovered_names + ["Enter manually…"]
+        selected = st.selectbox(
             "Local Ollama model",
-            discovered_names + ["Enter manually…"],
-            index=(discovered_names.index(initial_model) if initial_model in discovered_names else 0),
+            options,
+            index=discovered_names.index(initial) if initial in discovered_names else 0,
             key=f"model_select_{study_id}",
         )
-        if model_name == "Enter manually…":
-            model_name = st.text_input("Manual model name/tag", key=f"manual_model_{study_id}")
+        model_name = (
+            st.text_input("Manual model name/tag", key=f"manual_model_{study_id}")
+            if selected == "Enter manually…" else selected
+        )
     else:
         model_name = st.text_input(
             "Model name/tag",
@@ -112,13 +116,12 @@ def setup_page() -> None:
 
     with st.form(f"study_settings_{study_id}"):
         reviewer_id = st.text_input(
-            "Reviewer ID (staff or student ID)",
+            "Staff or student ID",
             value=str(study["reviewer_id"]),
             disabled=bool(study["reviewer_locked"]),
             help=(
-                "Enter your institutional staff/student ID or a study-specific pseudonym. "
-                "The value locks after the first generation or decision and is never "
-                "included in DPO exports."
+                "Stored only in local SQLite, omitted from exports, and locked after "
+                "generation or a segment decision."
             ),
         )
         symmetric = st.toggle(
@@ -146,16 +149,9 @@ def setup_page() -> None:
                 value=int(study["output_tokens"]), step=100,
             )
             context_tokens = st.number_input(
-                "Ollama context length (tokens)",
-                min_value=8192,
-                max_value=1048576,
-                value=int(study["context_tokens"]),
-                step=8192,
-                help=(
-                    "Maximum combined working context allocated by Ollama. The application "
-                    "sends this value explicitly as num_ctx for every generation. Larger "
-                    "values require more GPU or system memory."
-                ),
+                "Ollama context length (tokens)", min_value=8192, max_value=1048576,
+                value=int(study["context_tokens"]), step=8192,
+                help="Larger context windows require more GPU or system memory.",
             )
         save_settings = st.form_submit_button("Verify model and save settings", type="primary")
     if save_settings:
@@ -180,7 +176,6 @@ def setup_page() -> None:
             ) or model.digest
             if not digest:
                 raise ValueError("Ollama did not report a stable digest for the selected model.")
-            actual_after = int(context_before) if symmetric else int(context_after)
             store.update_study(
                 study_id,
                 reviewer_id=reviewer_id,
@@ -188,7 +183,7 @@ def setup_page() -> None:
                 model_name=model_name,
                 model_digest=digest,
                 context_before=int(context_before),
-                context_after=actual_after,
+                context_after=int(context_before) if symmetric else int(context_after),
                 symmetric_context=symmetric,
                 temperature=float(temperature),
                 top_p=float(top_p),
@@ -198,37 +193,28 @@ def setup_page() -> None:
             st.session_state[f"health_ok_{study_id}"] = {
                 "base_url": base_url.rstrip("/"), "model": model_name
             }
-            maximum_note = (
-                f" (model maximum: {model.context_length:,} tokens)"
-                if model.context_length is not None else ""
-            )
-            st.success(
-                f"Model {model_name} is available; context length {int(context_tokens):,} "
-                f"tokens was saved{maximum_note}."
-            )
+            st.success(f"Model {model_name} is available and the settings were saved.")
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
 
+
+def _research_question_setup(store: SQLiteStore, study_id: int) -> None:
     st.subheader("Research questions")
     st.caption(
-        "Enter the questions your qualitative analysis aims to answer. Use one row per "
-        "question, select the questions to include in model assessments, and use the + "
-        "control to add more rows. The Order value controls how questions appear in prompts."
+        "Use one row per question. Selected questions are snapshotted into every code prompt."
     )
-    current_questions = store.get_questions(study_id)
+    current = store.get_questions(study_id)
     editor_key = f"question_editor_{study_id}"
-    editor_data = [
+    data = [
         {
-            "id": row["id"], "order": row["display_order"], "selected": bool(row["selected"]),
-            "question": row["text"],
+            "id": row["id"], "order": row["display_order"],
+            "selected": bool(row["selected"]), "question": row["text"],
         }
-        for row in current_questions
-    ]
-    if not editor_data:
-        editor_data = [{"id": None, "order": 1, "selected": True, "question": ""}]
+        for row in current
+    ] or [{"id": None, "order": 1, "selected": True, "question": ""}]
     edited = st.data_editor(
-        editor_data,
+        data,
         num_rows="dynamic",
         key=editor_key,
         hide_index=True,
@@ -244,37 +230,40 @@ def setup_page() -> None:
         try:
             records = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited)
             records = [
-                row
-                for row in records
+                row for row in records
                 if _optional_int(row.get("id")) is not None
                 or str(row.get("question") or "").strip()
             ]
             if not records:
                 raise ValueError("Enter and select at least one research question.")
-            ordered = sorted(records, key=lambda row: int(row.get("order") or 0))
             drafts = [
                 QuestionDraft(
                     id=_optional_int(row.get("id")),
                     text=str(row.get("question") or ""),
                     selected=bool(row.get("selected", True)),
                 )
-                for row in ordered
+                for row in sorted(records, key=lambda row: int(row.get("order") or 0))
             ]
             store.save_questions(study_id, drafts)
-            st.success("Research-question versions and ordering were saved.")
             st.session_state.pop(editor_key, None)
+            st.success("Research-question versions and ordering were saved.")
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
 
+
+def _dataset_setup(store: SQLiteStore, study_id: int) -> None:
     st.subheader("Interview dataset")
+    st.caption(
+        "New imports are adaptation data: preferred pairs may be exported for another DPO round."
+    )
     datasets = store.list_datasets(study_id)
     if datasets:
         st.dataframe(
             [
                 {
-                    "Name": row["name"], "Split": row["split"],
-                    "Transcripts": row["transcript_count"], "Targets": row["target_count"],
+                    "Name": row["name"], "Transcripts": row["transcript_count"],
+                    "Targets": row["target_count"],
                     "SHA-256": str(row["source_sha256"])[:12] + "…",
                 }
                 for row in datasets
@@ -285,74 +274,63 @@ def setup_page() -> None:
     path_tab, upload_tab = st.tabs(["Import local path", "Upload one JSONL file"])
     with path_tab:
         with st.form(f"path_import_{study_id}"):
-            dataset_name = st.text_input("Dataset name", key=f"path_dataset_name_{study_id}")
-            split = st.selectbox("Data split", ["adaptation", "validation", "test"])
+            name = st.text_input("Dataset name", key=f"path_dataset_name_{study_id}")
             source_path = st.text_input("Segment JSONL file or directory path")
-            import_path = st.form_submit_button("Validate and import path")
-        if import_path:
+            submit = st.form_submit_button("Validate and import path")
+        if submit:
             _import_dataset(
-                store, study_id, dataset_name, split, "path",
+                store, study_id, name, "path",
                 lambda: TranscriptAdapter().from_path(Path(source_path)),
             )
     with upload_tab:
         with st.form(f"upload_import_{study_id}"):
-            upload_name = st.text_input("Dataset name", key=f"upload_dataset_name_{study_id}")
-            upload_split = st.selectbox(
-                "Data split", ["adaptation", "validation", "test"], key=f"upload_split_{study_id}"
-            )
+            name = st.text_input("Dataset name", key=f"upload_dataset_name_{study_id}")
             uploaded = st.file_uploader("Segment JSONL", type=["jsonl"])
-            import_upload = st.form_submit_button("Validate and import upload")
-        if import_upload:
+            submit = st.form_submit_button("Validate and import upload")
+        if submit:
             if uploaded is None:
                 st.error("Choose a JSONL file.")
             else:
                 _import_dataset(
-                    store, study_id, upload_name, upload_split, "upload",
+                    store, study_id, name, "upload",
                     lambda: TranscriptAdapter().from_upload(uploaded.name, uploaded.getvalue()),
                 )
 
     datasets = store.list_datasets(study_id)
     if datasets:
         labels = {
-            int(row["id"]): f"{row['name']} — {row['split']} ({row['target_count']} targets)"
-            for row in datasets
+            int(row["id"]): f"{row['name']} ({row['target_count']} targets)" for row in datasets
         }
-        selected_dataset = st.selectbox(
+        dataset_id = st.selectbox(
             "Dataset to review", list(labels), format_func=labels.get, key=f"dataset_{study_id}"
         )
-        selected = next(row for row in datasets if int(row["id"]) == selected_dataset)
-        if selected["split"] != "adaptation":
-            st.warning(
-                f"{selected['split'].title()} preferences are frozen from training export."
-            )
         if st.button("Start or resume review", type="primary"):
             if not store.get_questions(study_id, selected_only=True):
                 st.error("Save at least one selected research question first.")
             elif not store.get_study(study_id).get("model_digest"):
                 st.error("Verify and save an Ollama model first.")
             else:
-                store.set_active_dataset(study_id, selected_dataset)
-                st.session_state.active_dataset_id = selected_dataset
+                store.set_active_dataset(study_id, int(dataset_id))
+                st.session_state.active_dataset_id = int(dataset_id)
                 st.success("Review is ready. Open Review from the navigation menu.")
 
 
 def review_page() -> None:
     st.title("Review")
     config, store = _environment()
+    try:
+        store.get_singleton_study()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
     dataset_id = _active_dataset_id(store)
     if not dataset_id:
-        st.info("Choose a study and dataset on Setup, then select Start or resume review.")
-        return
-    try:
-        dataset = store.get_dataset(int(dataset_id))
-    except KeyError:
-        st.session_state.pop("active_dataset_id", None)
-        st.error("The selected dataset no longer exists.")
+        st.info("Import and select a dataset on Setup first.")
         return
     item = store.get_next_item(int(dataset_id))
     progress = store.progress(int(dataset_id))
     if item is None:
-        st.success(f"All {progress['total']} review items have final decisions.")
+        st.success(f"All {progress['total']} target segments are complete.")
         return
     study = store.get_study(item.study_id)
     client = HttpOllamaClient(
@@ -361,208 +339,297 @@ def review_page() -> None:
         generation_timeout_seconds=config.generation_timeout_seconds,
     )
     service = ReviewService(store, client)
-    snapshot = service.active_snapshot(item.id)
+    health_ok = _ollama_health(item.study_id, study, client)
 
-    health_key = f"health_ok_{item.study_id}"
-    expected_health = {
-        "base_url": str(study["ollama_base_url"]).rstrip("/"),
-        "model": str(study.get("model_name") or ""),
-    }
-    health_ok = st.session_state.get(health_key) == expected_health
-    health_column, status_column = st.columns([1, 3])
-    with health_column:
-        check_health = st.button("Check Ollama", use_container_width=True)
-    if check_health:
-        try:
-            client.show_model(expected_health["model"])
-            st.session_state[health_key] = expected_health
-            health_ok = True
-        except Exception as exc:
-            st.session_state.pop(health_key, None)
-            health_ok = False
-            st.error(str(exc))
-    with status_column:
-        if health_ok:
-            st.success(f"Ollama model available: {expected_health['model']}")
-        else:
-            st.warning("Check Ollama before generating. Existing review state is unaffected.")
-
-    st.caption(
-        f"Transcript {item.transcript_id} · Segment {item.segment_id} · "
-        f"{item.split.title()} · {progress['reviewed']} of {progress['total']} reviewed"
+    previous, following = select_context(
+        item.turns, item.target_turn_indexes,
+        int(study["context_before"]), int(study["context_after"]),
     )
-    if snapshot:
-        previous, target_turns, following = snapshot.previous, snapshot.target, snapshot.following
-    else:
-        previous, following = select_context(
-            item.turns, item.target_turn_indexes,
-            int(study["context_before"]), int(study["context_after"]),
-        )
-        target_set = set(item.target_turn_indexes)
-        target_turns = tuple(turn for turn in item.turns if turn.turn_index in target_set)
+    target_set = set(item.target_turn_indexes)
+    target_turns = tuple(turn for turn in item.turns if turn.turn_index in target_set)
+    questions = tuple(
+        str(row["text"]) for row in store.get_questions(item.study_id, selected_only=True)
+    )
+    _sticky_reference(item, target_turns, questions, progress)
     with st.expander(f"Previous context ({len(previous)} turns)", expanded=False):
         _show_turns(previous)
-    _target_card(item.target_text, target_turns)
     with st.expander(f"Next context ({len(following)} turns)", expanded=False):
         _show_turns(following)
 
-    questions = snapshot.questions if snapshot else tuple(
-        _question_view(row) for row in store.get_questions(item.study_id, selected_only=True)
-    )
-    st.markdown("**Selected research questions**")
-    for question in questions:
-        st.write(f"{question.text}")
-
-    generation_in_progress = bool(snapshot and snapshot.status == "generating")
-    generation_label = "Regenerate two responses" if snapshot else "Generate two responses"
-    with st.form(f"generate_{item.id}"):
-        code_label = st.text_area(
-            "Researcher qualitative code",
-            value=snapshot.code_label if snapshot else "",
-            height=100,
-            help="The exact submitted value is frozen into the generation snapshot and renderer.",
-        )
-        generate = st.form_submit_button(
-            generation_label, type="primary",
-            disabled=(
-                generation_in_progress
-                or not bool(study.get("model_digest"))
-                or not health_ok
-            ),
-        )
-    if generate:
+    st.subheader("Qualitative codes")
+    codes = service.list_code_reviews(item)
+    for code in codes:
+        _editable_code_row(service, item, code)
+    with st.form(f"add_code_{item.id}", clear_on_submit=True):
+        new_code = st.text_input("Add another qualitative code")
+        add = st.form_submit_button("Add code")
+    if add:
         try:
-            with st.spinner("Analysing and Generating"):
-                snapshot = service.generate_pair(
-                    item,
-                    code_label,
-                    replace_snapshot_id=(snapshot.id if snapshot else None),
-                )
-            st.success("Both responses and their A/B assignment were saved.")
+            service.add_code(item, new_code)
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
 
-    if snapshot:
-        if snapshot.status == "generating":
-            if st.button("Resume interrupted generation"):
-                try:
-                    with st.spinner("Resuming the saved generation snapshot…"):
-                        service.generate_pair(item, snapshot.code_label)
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-            with st.form(f"interrupted_skip_{item.id}_{snapshot.id}"):
-                interrupted_reason = st.text_area("Optional skip reason", height=70)
-                interrupted_skip = st.form_submit_button("Abandon generation and skip")
-            if interrupted_skip:
-                try:
-                    service.save_decision(
-                        item=item,
-                        decision="skip",
-                        reason=interrupted_reason,
-                        idempotency_key=decision_idempotency_key(item.id, "skip", snapshot.id),
-                    )
-                    st.rerun()
-                except Exception as exc:
-                    st.error(str(exc))
-        elif snapshot.candidates:
-            if snapshot.category_version != CATEGORY_CONTRACT_VERSION and any(
-                not _candidate_has_evidence(candidate.parsed, candidate.rendered_text)
-                for candidate in snapshot.candidates
-            ):
-                st.info(
-                    "This pair uses an older response contract without an evidence quote. "
-                    "Select Regenerate two responses to replace it with the current format."
-                )
-            columns = st.columns(2, gap="large")
-            for column, candidate in zip(columns, snapshot.candidates):
-                with column:
-                    st.subheader(f"Response {candidate.display_label}")
-                    if candidate.valid and candidate.rendered_text:
-                        _show_response(candidate.parsed, candidate.rendered_text)
-                    else:
-                        st.error("This response remained invalid after one repair attempt.")
-                        for error in candidate.validation_errors:
-                            st.caption(error)
-            all_valid = len(snapshot.candidates) == 2 and all(
-                candidate.valid and candidate.rendered_text for candidate in snapshot.candidates
+    codes = service.list_code_reviews(item)
+    pending = [code for code in codes if code.snapshot is None or code.status == "draft"]
+    if pending:
+        st.caption(
+            f"{len(pending)} code(s) await generation; each code produces two sequential Ollama calls."
+        )
+        if st.button(
+            f"Generate responses for {len(pending)} code(s)",
+            type="primary",
+            disabled=not health_ok,
+        ):
+            try:
+                with st.spinner("Analysing and Generating"):
+                    service.generate_pending_codes(item)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    codes = service.list_code_reviews(item)
+    all_draft_decisions = bool(codes)
+    for code in codes:
+        if code.snapshot is None:
+            all_draft_decisions = False
+            continue
+        chosen = _code_response_group(service, item, code, health_ok)
+        all_draft_decisions = all_draft_decisions and chosen
+
+    if st.button(
+        "Finish segment and next",
+        type="primary",
+        disabled=not all_draft_decisions,
+        use_container_width=True,
+    ):
+        try:
+            service.finalize_segment(
+                item,
+                idempotency_key=segment_idempotency_key(
+                    item.id, item.reviewer_id, "complete"
+                ),
             )
-            decision_options = (
-                ["Prefer A", "Prefer B", "Both poor", "Too similar", "Skip"]
-                if all_valid else ["Both poor", "Skip"]
-            )
-            with st.form(f"decision_{item.id}_{snapshot.id}"):
-                decision_label = st.radio("Decision", decision_options, horizontal=True)
-                reason = st.text_area("Optional reason", height=80)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    if not any(code.locked for code in codes):
+        with st.expander("Skip this target segment"):
+            with st.form(f"skip_segment_{item.id}"):
+                reason = st.text_area("Optional skip reason", height=70)
                 tags = st.multiselect("Optional issue tags", ISSUE_TAGS)
-                save = st.form_submit_button("Save and next", type="primary")
-            if save:
-                decision = {
-                    "Prefer A": "prefer_a", "Prefer B": "prefer_b",
-                    "Both poor": "both_poor", "Too similar": "too_similar", "Skip": "skip",
-                }[decision_label]
+                skip = st.form_submit_button("Skip this segment")
+            if skip:
                 try:
-                    service.save_decision(
-                        item=item, decision=decision, reason=reason, issue_tags=tags,
-                        idempotency_key=decision_idempotency_key(item.id, decision, snapshot.id),
+                    service.skip_segment(
+                        item,
+                        reason=reason,
+                        issue_tags=tags,
+                        idempotency_key=segment_idempotency_key(
+                            item.id, item.reviewer_id, "skip"
+                        ),
                     )
                     st.rerun()
                 except Exception as exc:
                     st.error(str(exc))
 
-    if snapshot is None:
-        with st.form(f"pregen_skip_{item.id}"):
-            skip_reason = st.text_area("Optional skip reason", height=70)
-            skip_tags = st.multiselect("Optional issue tags", ISSUE_TAGS, key=f"skip_tags_{item.id}")
-            skip = st.form_submit_button("Skip this segment")
-        if skip:
+
+def _editable_code_row(service: ReviewService, item: Any, code: CodeReviewView) -> None:
+    if code.locked:
+        st.markdown(f"**Code {code.ordinal}:** {code.code_label}")
+        return
+    with st.form(f"edit_code_{code.id}"):
+        value = st.text_input(f"Code {code.ordinal}", value=code.code_label)
+        left, right = st.columns(2)
+        update = left.form_submit_button("Update code", use_container_width=True)
+        remove = right.form_submit_button("Remove code", use_container_width=True)
+    if update:
+        try:
+            service.update_code(item, code.id, value)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if remove:
+        try:
+            service.remove_code(item, code.id)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def _code_response_group(
+    service: ReviewService,
+    item: Any,
+    code: CodeReviewView,
+    health_ok: bool,
+) -> bool:
+    snapshot = code.snapshot
+    assert snapshot is not None
+    st.markdown(f"### Code {code.ordinal}: {html.escape(code.code_label)}", unsafe_allow_html=True)
+    if code.replacement_in_progress:
+        if code.draft.snapshot_id is None:
+            st.warning("Generation was interrupted. Any completed model call remains saved.")
+        else:
+            st.warning(
+                "A replacement pair was interrupted. The previous pair and draft remain saved."
+            )
+        if st.button("Resume generation", key=f"resume_{code.id}", disabled=not health_ok):
             try:
-                service.save_decision(
-                    item=item, decision="skip", reason=skip_reason, issue_tags=skip_tags,
-                    idempotency_key=decision_idempotency_key(item.id, "skip", None),
-                )
+                with st.spinner("Resuming the saved generation…"):
+                    service.resume_pending_generation(item, code.id)
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
+    elif st.button(
+        "Regenerate this code pair", key=f"regen_{code.id}", disabled=not health_ok
+    ):
+        try:
+            with st.spinner("Analysing and Generating"):
+                service.regenerate_code(item, code.id)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    candidates = {candidate.display_label: candidate for candidate in snapshot.candidates}
+    columns = st.columns(2, gap="large")
+    effective: dict[str, str | None] = {}
+    for column, label in zip(columns, ("A", "B")):
+        candidate = candidates.get(label)
+        with column:
+            st.markdown(f"#### Response {label}")
+            if candidate is None or not candidate.valid or not candidate.reflective_question:
+                st.error("This response remained invalid after one repair attempt.")
+                if candidate:
+                    for error in candidate.validation_errors:
+                        st.caption(error)
+                effective[label] = None
+                continue
+            default_category = (
+                code.draft.category_a_id if label == "A" else code.draft.category_b_id
+            ) or candidate.model_category_id
+            category_ids = [spec.id for spec in CATEGORY_SPECS]
+            selected = st.selectbox(
+                "Code category",
+                category_ids,
+                index=category_ids.index(default_category) if default_category in category_ids else 0,
+                format_func=lambda value: CATEGORY_BY_ID[value].display_label,
+                key=f"category_{code.id}_{snapshot.id}_{label}",
+            )
+            effective[label] = selected
+            st.markdown(
+                _response_card_html(
+                    (ResponseSection("Reflective question", candidate.reflective_question),)
+                ),
+                unsafe_allow_html=True,
+            )
+
+    all_valid = len(candidates) == 2 and all(
+        candidate.valid and candidate.reflective_question for candidate in candidates.values()
+    )
+    allowed = (
+        ["Choose a decision…", "Prefer A", "Prefer B", "Both poor", "Too similar", "Skip"]
+        if all_valid else ["Choose a decision…", "Both poor", "Skip"]
+    )
+    initial_label = DECISION_BY_VALUE.get(code.draft.decision, "Choose a decision…")
+    if initial_label not in allowed:
+        initial_label = "Choose a decision…"
+    decision_label = st.selectbox(
+        "Decision",
+        allowed,
+        index=allowed.index(initial_label),
+        key=f"decision_{code.id}_{snapshot.id}",
+    )
+    reason = st.text_area(
+        "Optional reason",
+        value=code.draft.reason,
+        height=70,
+        key=f"reason_{code.id}_{snapshot.id}",
+    )
+    tags = st.multiselect(
+        "Optional issue tags",
+        ISSUE_TAGS,
+        default=list(code.draft.issue_tags),
+        key=f"tags_{code.id}_{snapshot.id}",
+    )
+    decision = DECISION_LABELS[decision_label]
+    try:
+        service.save_code_draft(
+            item=item,
+            code_review_id=code.id,
+            snapshot_id=snapshot.id,
+            decision=decision,
+            category_a_id=effective.get("A"),
+            category_b_id=effective.get("B"),
+            reason=reason,
+            issue_tags=tags,
+        )
+        st.caption("Draft saved automatically.")
+    except Exception as exc:
+        st.error(f"Draft was not saved: {exc}")
+        return False
+    return (
+        decision is not None
+        and code.status in {"ready", "invalid"}
+        and not code.replacement_in_progress
+    )
 
 
 def progress_page() -> None:
     st.title("Progress and export")
     config, store = _environment()
+    try:
+        store.get_singleton_study()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
     dataset_id = _active_dataset_id(store)
     if not dataset_id:
         st.info("Choose a dataset on Setup first.")
         return
     dataset = store.get_dataset(int(dataset_id))
     progress = store.progress(int(dataset_id))
-    labels = [
-        ("Total", "total"), ("Unreviewed", "unreviewed"), ("Generated", "generated"),
-        ("Preferred", "preferred"), ("Both poor", "both_poor"),
-        ("Too similar", "too_similar"), ("Skipped", "skipped"), ("Latest invalid", "invalid"),
+    exporter = PreferenceExporter(store, config.export_directory)
+    preview = exporter.preview(int(dataset_id))
+
+    st.subheader("Target segments")
+    segment_metrics = [
+        ("Total", "total"), ("Completed", "segment_completed"),
+        ("Unfinished", "unreviewed"), ("Skipped", "segment_skipped"),
     ]
     columns = st.columns(4)
-    for index, (label, key) in enumerate(labels):
+    for column, (label, key) in zip(columns, segment_metrics):
+        column.metric(label, progress[key])
+
+    st.subheader("Code reviews")
+    code_metrics = [
+        ("Total codes", "code_total"), ("Unfinished", "code_unfinished"),
+        ("Generated", "generated"), ("Preferred", "preferred"),
+        ("Both poor", "both_poor"), ("Too similar", "too_similar"),
+        ("Skipped", "skipped"), ("Invalid", "invalid"),
+    ]
+    columns = st.columns(4)
+    for index, (label, key) in enumerate(code_metrics):
         columns[index % 4].metric(label, progress[key])
-    st.caption("Generated and latest-invalid counts may overlap final decision counts.")
+    st.metric("Export eligible", preview.eligible_count)
 
     records = store.list_records(int(dataset_id))
-    decision_filter = st.selectbox(
-        "Filter saved records",
-        ["All", "Unreviewed", "prefer_a", "prefer_b", "both_poor", "too_similar", "skip"],
-    )
-    filtered = records
-    if decision_filter == "Unreviewed":
-        filtered = [row for row in records if not row.get("decision")]
-    elif decision_filter != "All":
-        filtered = [row for row in records if row.get("decision") == decision_filter]
+    record_filter = st.selectbox("Filter target segments", ["All", "Unfinished", "Completed", "Skipped"])
+    if record_filter == "Unfinished":
+        filtered = [row for row in records if not row.get("segment_outcome")]
+    elif record_filter == "Completed":
+        filtered = [row for row in records if row.get("segment_outcome") == "completed"]
+    elif record_filter == "Skipped":
+        filtered = [row for row in records if row.get("segment_outcome") == "skipped"]
+    else:
+        filtered = records
     st.dataframe(
         [
             {
                 "Transcript": row["transcript_id"], "Segment": row["segment_id"],
-                "Record": row["record_id"], "Status": row["status"],
-                "Generation": row["generation_status"], "Decision": row["decision"],
-                "Reason": row["reason"],
+                "Record": row["record_id"], "Segment status": row["segment_outcome"] or "unfinished",
+                "Codes": row["code_count"], "Code decisions": row["code_decision_count"],
+                "Preferred": row["preferred_count"] or 0, "Invalid": row["invalid_count"] or 0,
             }
             for row in filtered
         ],
@@ -571,33 +638,216 @@ def progress_page() -> None:
     )
     if records:
         inspect_id = st.selectbox(
-            "Inspect one saved record", [int(row["id"]) for row in records],
+            "Inspect one saved record",
+            [int(row["id"]) for row in records],
             format_func=lambda value: next(
-                f"{row['transcript_id']} / {row['segment_id']}" for row in records if row["id"] == value
+                f"{row['transcript_id']} / {row['segment_id']}"
+                for row in records if int(row["id"]) == value
             ),
         )
         with st.expander("Protected record details", expanded=False):
             _show_record_details(store, inspect_id)
 
     st.subheader("DPO export")
-    exporter = PreferenceExporter(store, config.export_directory)
-    preview = exporter.preview(int(dataset_id))
-    st.metric("Eligible adaptation preferences", preview.eligible_count)
     if preview.exclusion_counts:
         st.json(preview.exclusion_counts)
     disabled = dataset["split"] != "adaptation" or preview.eligible_count == 0
     if dataset["split"] != "adaptation":
-        st.warning(f"Export is disabled for the immutable {dataset['split']} split.")
+        st.warning(f"This historical {dataset['split']} dataset remains blocked from training export.")
     if st.button("Export eligible preference pairs", type="primary", disabled=disabled):
         try:
             result = exporter.export(int(dataset_id))
-            st.success(
-                f"Exported {result.row_count} validated rows to {result.jsonl_path}"
-            )
+            st.success(f"Exported {result.row_count} validated rows to {result.jsonl_path}")
             st.code(str(result.manifest_path))
             st.caption(f"Loader validation: {result.validation_result}; SHA-256: {result.sha256}")
         except Exception as exc:
             st.error(str(exc))
+
+
+def _show_record_details(store: SQLiteStore, item_id: int) -> None:
+    with store.connection() as connection:
+        item = connection.execute(
+            """
+            SELECT ri.target_text, t.transcript_id, ri.segment_id, ri.record_id,
+                   sc.outcome, sc.reason AS segment_reason
+            FROM review_items ri JOIN transcripts t ON t.id = ri.transcript_pk
+            LEFT JOIN segment_completions sc ON sc.review_item_id = ri.id
+            WHERE ri.id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+        codes = connection.execute(
+            """
+            SELECT cr.id, cr.ordinal, cr.code_label, cr.status, cd.id AS decision_id,
+                   cd.decision, cd.reason, cd.issue_tags_json,
+                   COALESCE(cd.snapshot_id, draft.snapshot_id) AS snapshot_id,
+                   draft.category_a_id AS draft_category_a_id,
+                   draft.category_b_id AS draft_category_b_id
+            FROM code_reviews cr
+            LEFT JOIN code_decisions cd ON cd.code_review_id = cr.id
+            LEFT JOIN code_review_drafts draft ON draft.code_review_id = cr.id
+            WHERE cr.review_item_id = ? AND cr.status <> 'abandoned'
+            ORDER BY cr.ordinal
+            """,
+            (item_id,),
+        ).fetchall()
+    if item:
+        st.markdown(f"**{item['transcript_id']} / {item['segment_id']} / {item['record_id']}**")
+        st.caption(f"Segment outcome: {item['outcome'] or 'unfinished'}")
+        st.text(str(item["target_text"]))
+    for code in codes:
+        st.markdown(f"### Code {code['ordinal']}: {code['code_label']}")
+        st.caption(f"Status: {code['status']}; decision: {code['decision'] or 'draft'}")
+        if code["snapshot_id"] is None:
+            continue
+        with store.connection() as connection:
+            candidates = connection.execute(
+                """
+                SELECT ab.display_label, c.parsed_json, c.rendered_text,
+                       c.validation_errors_json, c.valid, cdc.category_id
+                FROM ab_assignments ab JOIN candidates c ON c.id = ab.candidate_id
+                LEFT JOIN code_decision_categories cdc
+                  ON cdc.decision_id = ? AND cdc.candidate_id = c.id
+                WHERE ab.snapshot_id = ? ORDER BY ab.display_label
+                """,
+                (code["decision_id"], code["snapshot_id"]),
+            ).fetchall()
+        columns = st.columns(2)
+        for column, candidate in zip(columns, candidates):
+            with column:
+                st.markdown(f"**Response {candidate['display_label']}**")
+                parsed = _parsed_object(candidate["parsed_json"])
+                fields = historical_candidate_fields(parsed, candidate["rendered_text"])
+                draft_category = (
+                    code["draft_category_a_id"]
+                    if candidate["display_label"] == "A"
+                    else code["draft_category_b_id"]
+                )
+                effective = candidate["category_id"] or draft_category or (fields[0] if fields else None)
+                if candidate["valid"] and fields and effective:
+                    _show_response(parsed, str(candidate["rendered_text"]), effective_category_id=effective)
+                else:
+                    st.json(json.loads(candidate["validation_errors_json"]))
+
+
+def _ollama_health(study_id: int, study: dict[str, Any], client: HttpOllamaClient) -> bool:
+    key = f"health_ok_{study_id}"
+    expected = {
+        "base_url": str(study["ollama_base_url"]).rstrip("/"),
+        "model": str(study.get("model_name") or ""),
+    }
+    health_ok = st.session_state.get(key) == expected
+    check_column, status_column = st.columns([1, 3])
+    with check_column:
+        check = st.button("Check Ollama", use_container_width=True)
+    if check:
+        try:
+            client.show_model(expected["model"])
+            st.session_state[key] = expected
+            health_ok = True
+        except Exception as exc:
+            st.session_state.pop(key, None)
+            health_ok = False
+            st.error(str(exc))
+    with status_column:
+        if health_ok:
+            st.success(f"Ollama model available: {expected['model']}")
+        else:
+            st.warning("Check Ollama before generating. Saved review state is unaffected.")
+    return health_ok
+
+
+def _sticky_reference(
+    item: Any,
+    target_turns: tuple[TranscriptTurn, ...],
+    questions: tuple[str, ...],
+    progress: dict[str, int],
+) -> None:
+    turns = ", ".join(str(turn.turn_index) for turn in target_turns)
+    # Streamlit wraps Markdown in a same-height element container. The CSS therefore locates
+    # this enclosing layout block through the reference card and pins that outer block.
+    with st.container(key="review_reference_panel"):
+        st.markdown(
+            sticky_reference_html(
+                transcript_id=item.transcript_id,
+                segment_id=item.segment_id,
+                split=item.split,
+                target_text=item.target_text,
+                turn_labels=turns,
+                questions=questions,
+                reviewed=progress["reviewed"],
+                total=progress["total"],
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def sticky_reference_html(
+    *,
+    transcript_id: str,
+    segment_id: str,
+    split: str,
+    target_text: str,
+    turn_labels: str,
+    questions: tuple[str, ...],
+    reviewed: int,
+    total: int,
+) -> str:
+    question_html = "".join(f"<li>{html.escape(question)}</li>" for question in questions)
+    target = html.escape(target_text).replace("\n", "<br>")
+    metadata = html.escape(
+        f"Transcript {transcript_id} · Segment {segment_id} · Split {split} · "
+        f"{reviewed} of {total} segments finalized"
+    )
+    return f"""
+        <div class="sticky-reference">
+          <div class="sticky-metadata">{metadata}</div>
+          <div class="sticky-grid">
+            <div><div class="sticky-label">TARGET SEGMENT · TURN(S) {html.escape(turn_labels)}</div>
+                 <div class="sticky-target">{target}</div></div>
+            <div><div class="sticky-label">SELECTED RESEARCH QUESTIONS</div>
+                 <ol class="sticky-questions">{question_html}</ol></div>
+          </div>
+        </div>
+        """
+
+
+def _show_response(
+    parsed: dict[str, Any] | None,
+    rendered_text: str,
+    *,
+    effective_category_id: str | None = None,
+) -> None:
+    fields = historical_candidate_fields(parsed, rendered_text)
+    if not fields:
+        st.text(rendered_text)
+        return
+    payload = {"category_id": fields[0], "reflective_question": fields[1]}
+    sections = response_sections(payload, effective_category_id=effective_category_id)
+    st.markdown(_response_card_html(sections), unsafe_allow_html=True)
+
+
+def _response_card_html(sections: tuple[ResponseSection, ...]) -> str:
+    fields: list[str] = []
+    for section in sections:
+        label = html.escape(section.label)
+        value = html.escape(section.value).replace("\n", "<br>")
+        fields.append(
+            f'<div class="response-field"><div class="response-field-label">{label}</div>'
+            f'<div class="response-field-value">{value}</div></div>'
+        )
+    return '<div class="response-card">' + "".join(fields) + "</div>"
+
+
+def _show_turns(turns: tuple[TranscriptTurn, ...]) -> None:
+    if not turns:
+        st.caption("No context turns in this direction.")
+        return
+    for turn in turns:
+        st.markdown(
+            f"**Turn {turn.turn_index} · {turn.speaker_label or turn.speaker.capitalize()}**  \n"
+            f"{turn.text}"
+        )
 
 
 def _environment() -> tuple[AppConfig, SQLiteStore]:
@@ -621,15 +871,16 @@ def _import_dataset(
     store: SQLiteStore,
     study_id: int,
     name: str,
-    split: str,
     source_kind: str,
     loader: Any,
 ) -> None:
     try:
         bundle = loader()
-        dataset_id, created = store.import_dataset(
-            study_id=study_id, name=name, split=split,
-            source_kind=source_kind, bundle=bundle,
+        dataset_id, created = store.import_adaptation_dataset(
+            study_id=study_id,
+            name=name,
+            source_kind=source_kind,
+            bundle=bundle,
         )
         st.session_state.active_dataset_id = dataset_id
         store.set_active_dataset(study_id, dataset_id)
@@ -638,142 +889,16 @@ def _import_dataset(
                 f"Imported {len(bundle.transcripts)} transcript(s) and {bundle.target_count} target(s)."
             )
         else:
-            st.info("This dataset checksum and split already exist; existing progress was resumed.")
+            st.info("This adaptation dataset is already imported; existing progress was resumed.")
         st.rerun()
     except Exception as exc:
         st.error(str(exc))
 
 
-def _target_card(target_text: str, target_turns: tuple[TranscriptTurn, ...]) -> None:
-    turn_labels = ", ".join(str(turn.turn_index) for turn in target_turns)
-    st.markdown(
-        "<div class='target-card'><div class='target-label'>TARGET SEGMENT · TURN(S) "
-        + html.escape(turn_labels)
-        + "</div><div>"
-        + html.escape(target_text).replace("\n", "<br>")
-        + "</div></div>",
-        unsafe_allow_html=True,
-    )
-
-
-def _show_turns(turns: tuple[TranscriptTurn, ...]) -> None:
-    if not turns:
-        st.caption("No context turns in this direction.")
-        return
-    for turn in turns:
-        st.markdown(
-            f"**Turn {turn.turn_index} · {turn.speaker_label or turn.speaker.capitalize()}**  \n"
-            f"{turn.text}"
-        )
-
-
-def _question_view(row: dict[str, Any]) -> Any:
-    from .prompting import QuestionSnapshot
-
-    return QuestionSnapshot(id=int(row["id"]), version=int(row["version"]), text=str(row["text"]))
-
-
 def _optional_int(value: Any) -> int | None:
-    if value in (None, "") or value != value:  # NaN from a newly added data-editor row
+    if value in (None, "") or value != value:
         return None
     return int(value)
-
-
-def _show_record_details(store: SQLiteStore, item_id: int) -> None:
-    with store.connection() as connection:
-        item = connection.execute(
-            """
-            SELECT ri.target_text, t.transcript_id, ri.segment_id, ri.record_id
-            FROM review_items ri JOIN transcripts t ON t.id = ri.transcript_pk
-            WHERE ri.id = ?
-            """,
-            (item_id,),
-        ).fetchone()
-        decision = connection.execute(
-            "SELECT decision, reason, issue_tags_json, created_at FROM decisions WHERE review_item_id = ?",
-            (item_id,),
-        ).fetchone()
-        candidates = connection.execute(
-            """
-            SELECT ab.display_label, c.valid, c.parsed_json, c.rendered_text,
-                   c.validation_errors_json, gs.category_version
-            FROM generation_snapshots gs
-            JOIN ab_assignments ab ON ab.snapshot_id = gs.id
-            JOIN candidates c ON c.id = ab.candidate_id
-            WHERE gs.review_item_id = ? AND gs.status IN ('ready', 'invalid')
-            ORDER BY gs.attempt_number DESC, ab.display_label
-            """,
-            (item_id,),
-        ).fetchall()
-    if item:
-        st.markdown(f"**{item['transcript_id']} / {item['segment_id']} / {item['record_id']}**")
-        st.text(str(item["target_text"]))
-    if decision:
-        st.json(dict(decision))
-    for candidate in candidates[:2]:
-        st.markdown(f"**Response {candidate['display_label']}**")
-        if candidate["rendered_text"]:
-            _show_response(_parsed_object(candidate["parsed_json"]), str(candidate["rendered_text"]))
-        else:
-            st.json(json.loads(candidate["validation_errors_json"]))
-
-
-def _show_response(parsed: dict[str, Any] | None, rendered_text: str) -> None:
-    sections = response_sections(parsed or {})
-    if not sections:
-        sections = _sections_from_rendered(rendered_text)
-    if sections:
-        st.markdown(_response_card_html(sections), unsafe_allow_html=True)
-        return
-    st.text(normalize_response_text(rendered_text))
-
-
-def _sections_from_rendered(rendered_text: str) -> tuple[ResponseSection, ...]:
-    allowed_labels = {
-        "Code category",
-        "Evidence quote",
-        *(heading for spec in CATEGORY_SPECS for _, heading in spec.rendered_fields),
-    }
-    sections: list[ResponseSection] = []
-    for line in normalize_response_text(rendered_text).splitlines():
-        label, separator, value = line.partition(":")
-        if separator and label in allowed_labels:
-            sections.append(
-                ResponseSection(label, value.lstrip(), is_evidence=label == "Evidence quote")
-            )
-        elif sections:
-            previous = sections[-1]
-            sections[-1] = ResponseSection(
-                previous.label,
-                f"{previous.value}\n{line}",
-                is_evidence=previous.is_evidence,
-            )
-    return tuple(sections)
-
-
-def _candidate_has_evidence(
-    parsed: dict[str, Any] | None,
-    rendered_text: str | None,
-) -> bool:
-    if parsed and (parsed.get("evidence_quote") or parsed.get("actual_segment_quote")):
-        return True
-    normalized = normalize_response_text(rendered_text or "")
-    return any(line.startswith("Evidence quote:") for line in normalized.splitlines())
-
-
-def _response_card_html(sections: tuple[ResponseSection, ...]) -> str:
-    fields: list[str] = []
-    for section in sections:
-        field_class = " response-field-evidence" if section.is_evidence else ""
-        label = html.escape(section.label)
-        value = html.escape(section.value).replace("\n", "<br>")
-        fields.append(
-            f'<div class="response-field{field_class}">'
-            f'<div class="response-field-label">{label}</div>'
-            f'<div class="response-field-value">{value}</div>'
-            "</div>"
-        )
-    return '<div class="response-card">' + "".join(fields) + "</div>"
 
 
 def _parsed_object(value: Any) -> dict[str, Any] | None:
@@ -791,26 +916,35 @@ def inject_styles() -> None:
         """
         <style>
         .block-container {max-width: 1180px; padding-top: 2rem;}
-        .target-card {
+        div[data-testid="stLayoutWrapper"]:has(.sticky-reference) {
+            position: sticky !important;
+            top: 3.75rem;
+            z-index: 999991;
+            align-self: stretch;
+        }
+        .sticky-reference {
             border: 1px solid #77a88d;
             border-left: 6px solid #2d6a4f;
-            border-radius: 0.55rem;
-            padding: 1rem 1.15rem;
-            margin: 0.8rem 0;
-            background: rgba(82, 183, 136, 0.10);
-            line-height: 1.6;
+            border-radius: 0.65rem;
+            padding: 0.85rem 1rem;
+            margin: 0.5rem 0 1rem;
+            background: #ffffff;
+            box-shadow: 0 0.25rem 0.8rem rgba(0, 0, 0, 0.08);
+            max-height: 46vh;
+            overflow-y: auto;
         }
-        .target-label {font-size: 0.78rem; font-weight: 700; letter-spacing: 0.04em; margin-bottom: 0.4rem;}
+        .sticky-grid {display: grid; grid-template-columns: 1.35fr 1fr; gap: 1.2rem;}
+        .sticky-metadata {font-size: 0.78rem; color: #5f6368; margin-bottom: 0.55rem;}
+        .sticky-label {font-size: 0.76rem; font-weight: 750; letter-spacing: 0.04em; margin-bottom: 0.3rem;}
+        .sticky-target {line-height: 1.5;}
+        .sticky-questions {margin: 0.15rem 0 0 1.2rem; padding: 0; line-height: 1.45;}
         .response-card {
             border: 1px solid rgba(49, 51, 63, 0.18);
             border-radius: 0.7rem;
             padding: 0.35rem 1rem;
             background: rgba(248, 249, 251, 0.72);
         }
-        .response-field {
-            padding: 0.8rem 0;
-            border-bottom: 1px solid rgba(49, 51, 63, 0.10);
-        }
+        .response-field {padding: 0.8rem 0; border-bottom: 1px solid rgba(49, 51, 63, 0.10);}
         .response-field:last-child {border-bottom: 0;}
         .response-field-label {
             display: inline-block;
@@ -821,18 +955,15 @@ def inject_styles() -> None:
             color: #24553f;
             font-size: 0.78rem;
             font-weight: 700;
-            letter-spacing: 0.025em;
         }
         .response-field-value {line-height: 1.55; overflow-wrap: anywhere;}
-        .response-field-evidence {
-            margin: 0.45rem 0;
-            padding: 0.75rem 0.8rem;
-            border: 0;
-            border-left: 4px solid #4c956c;
-            border-radius: 0.35rem;
-            background: rgba(82, 183, 136, 0.10);
+        @media (max-width: 760px) {
+            div[data-testid="stLayoutWrapper"]:has(.sticky-reference) {top: 3.5rem;}
+            .sticky-reference {max-height: 55vh;}
+            .sticky-grid {grid-template-columns: 1fr;}
         }
         @media (prefers-color-scheme: dark) {
+            .sticky-reference {background: #0e1117;}
             .response-card {background: rgba(28, 31, 36, 0.72);}
             .response-field-label {color: #b7e4c7;}
         }

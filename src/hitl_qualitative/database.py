@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from .categories import CATEGORY_SPECS
 from .transcripts import ImportBundle, TranscriptTurn
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SPLITS = {"adaptation", "validation", "test"}
 
 
@@ -252,6 +253,104 @@ ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 65536 CHECK (context_tokens >
 """
 
 
+MIGRATION_3 = """
+CREATE TABLE code_reviews (
+    id INTEGER PRIMARY KEY,
+    review_item_id INTEGER NOT NULL REFERENCES review_items(id) ON DELETE CASCADE,
+    reviewer_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+    code_label TEXT NOT NULL,
+    dedupe_label TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (
+        status IN ('draft', 'generating', 'ready', 'invalid', 'finalized', 'abandoned')
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(review_item_id, reviewer_id, ordinal),
+    UNIQUE(review_item_id, reviewer_id, dedupe_label)
+);
+
+ALTER TABLE generation_snapshots
+ADD COLUMN code_review_id INTEGER REFERENCES code_reviews(id) ON DELETE CASCADE;
+
+DROP INDEX one_live_snapshot_per_item;
+
+CREATE UNIQUE INDEX one_live_snapshot_per_code
+ON generation_snapshots(code_review_id)
+WHERE code_review_id IS NOT NULL
+  AND status IN ('generating', 'ready', 'invalid');
+
+CREATE INDEX code_reviews_item
+ON code_reviews(review_item_id, reviewer_id, ordinal);
+
+CREATE TABLE code_review_drafts (
+    code_review_id INTEGER PRIMARY KEY REFERENCES code_reviews(id) ON DELETE CASCADE,
+    snapshot_id INTEGER REFERENCES generation_snapshots(id) ON DELETE SET NULL,
+    decision TEXT CHECK (
+        decision IS NULL OR decision IN ('prefer_a', 'prefer_b', 'both_poor', 'too_similar', 'skip')
+    ),
+    category_a_id TEXT CHECK (
+        category_a_id IS NULL OR category_a_id IN (
+            'wrong_code', 'descriptive_not_answering_rq', 'too_broad', 'useful_analytical_code'
+        )
+    ),
+    category_b_id TEXT CHECK (
+        category_b_id IS NULL OR category_b_id IN (
+            'wrong_code', 'descriptive_not_answering_rq', 'too_broad', 'useful_analytical_code'
+        )
+    ),
+    reason TEXT,
+    issue_tags_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE code_decisions (
+    id INTEGER PRIMARY KEY,
+    code_review_id INTEGER NOT NULL REFERENCES code_reviews(id) ON DELETE CASCADE,
+    snapshot_id INTEGER REFERENCES generation_snapshots(id),
+    reviewer_id TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (
+        decision IN ('prefer_a', 'prefer_b', 'both_poor', 'too_similar', 'skip')
+    ),
+    preferred_candidate_id INTEGER REFERENCES candidates(id),
+    reason TEXT,
+    issue_tags_json TEXT NOT NULL DEFAULT '[]',
+    idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(code_review_id),
+    UNIQUE(idempotency_key)
+);
+
+CREATE TABLE code_decision_categories (
+    decision_id INTEGER NOT NULL REFERENCES code_decisions(id) ON DELETE CASCADE,
+    display_label TEXT NOT NULL CHECK (display_label IN ('A', 'B')),
+    candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+    category_id TEXT NOT NULL CHECK (
+        category_id IN (
+            'wrong_code', 'descriptive_not_answering_rq', 'too_broad', 'useful_analytical_code'
+        )
+    ),
+    PRIMARY KEY(decision_id, display_label),
+    UNIQUE(decision_id, candidate_id)
+);
+
+CREATE TABLE segment_completions (
+    id INTEGER PRIMARY KEY,
+    review_item_id INTEGER NOT NULL REFERENCES review_items(id) ON DELETE CASCADE,
+    reviewer_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'skipped')),
+    reason TEXT,
+    issue_tags_json TEXT NOT NULL DEFAULT '[]',
+    idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(review_item_id, reviewer_id),
+    UNIQUE(idempotency_key)
+);
+
+CREATE INDEX code_decisions_dataset ON code_decisions(code_review_id, decision);
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class QuestionDraft:
     id: int | None
@@ -297,6 +396,21 @@ class SQLiteStore:
             if current < 2:
                 connection.executescript(MIGRATION_2)
                 connection.execute("PRAGMA user_version = 2")
+                current = 2
+            if current < 3:
+                study_count = int(
+                    connection.execute("SELECT COUNT(*) FROM studies").fetchone()[0]
+                )
+                if study_count > 1:
+                    raise RuntimeError(
+                        "Schema version 2 contains multiple studies. Migration to the "
+                        "singleton interface was stopped before making any changes; use a "
+                        "separate database or consolidate the studies first. No study was "
+                        "selected or deleted."
+                    )
+                connection.executescript(MIGRATION_3)
+                _backfill_multi_code_schema(connection)
+                connection.execute("PRAGMA user_version = 3")
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -365,6 +479,42 @@ class SQLiteStore:
     def list_studies(self) -> list[dict[str, Any]]:
         with self.connection() as connection:
             return [dict(row) for row in connection.execute("SELECT * FROM studies ORDER BY id")]
+
+    def get_singleton_study(self) -> dict[str, Any] | None:
+        studies = self.list_studies()
+        if len(studies) > 1:
+            raise RuntimeError(
+                "This database contains multiple studies. The simplified interface will not "
+                "choose between them automatically; use a separate database or consolidate "
+                "the studies before continuing. No study was selected or deleted."
+            )
+        return studies[0] if studies else None
+
+    def create_singleton_study(
+        self,
+        *,
+        reviewer_id: str,
+        ollama_base_url: str,
+        context_before: int = 20,
+        context_after: int = 20,
+        temperature: float = 0.4,
+        top_p: float = 0.9,
+        output_tokens: int = 5000,
+        context_tokens: int = 65536,
+    ) -> int:
+        if self.get_singleton_study() is not None:
+            raise ValueError("The local study has already been initialized.")
+        return self.create_study(
+            name="Local qualitative analysis",
+            reviewer_id=reviewer_id,
+            ollama_base_url=ollama_base_url,
+            context_before=context_before,
+            context_after=context_after,
+            temperature=temperature,
+            top_p=top_p,
+            output_tokens=output_tokens,
+            context_tokens=context_tokens,
+        )
 
     def get_study(self, study_id: int) -> dict[str, Any]:
         with self.connection() as connection:
@@ -612,6 +762,23 @@ class SQLiteStore:
                     )
             return dataset_id, True
 
+    def import_adaptation_dataset(
+        self,
+        *,
+        study_id: int,
+        name: str,
+        source_kind: str,
+        bundle: ImportBundle,
+    ) -> tuple[int, bool]:
+        """Import a new UI dataset with the fixed training-eligible split."""
+        return self.import_dataset(
+            study_id=study_id,
+            name=name,
+            split="adaptation",
+            source_kind=source_kind,
+            bundle=bundle,
+        )
+
     def list_datasets(self, study_id: int) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
@@ -661,8 +828,9 @@ class SQLiteStore:
                 JOIN datasets d ON d.id = ri.dataset_id
                 JOIN studies s ON s.id = d.study_id
                 JOIN transcripts t ON t.id = ri.transcript_pk
-                LEFT JOIN decisions dec ON dec.review_item_id = ri.id
-                WHERE ri.dataset_id = ? AND dec.id IS NULL
+                LEFT JOIN segment_completions sc
+                  ON sc.review_item_id = ri.id AND sc.reviewer_id = s.reviewer_id
+                WHERE ri.dataset_id = ? AND sc.id IS NULL
                 ORDER BY ri.source_order LIMIT 1
                 """,
                 (dataset_id,),
@@ -701,27 +869,51 @@ class SQLiteStore:
                 str(row["decision"]): int(row["count"])
                 for row in connection.execute(
                     """
-                    SELECT d.decision, COUNT(*) AS count FROM decisions d
-                    JOIN review_items ri ON ri.id = d.review_item_id
-                    WHERE ri.dataset_id = ? GROUP BY d.decision
+                    SELECT cd.decision, COUNT(*) AS count FROM code_decisions cd
+                    JOIN code_reviews cr ON cr.id = cd.code_review_id
+                    JOIN review_items ri ON ri.id = cr.review_item_id
+                    WHERE ri.dataset_id = ? GROUP BY cd.decision
                     """,
                     (dataset_id,),
                 )
             }
-            reviewed = sum(decision_counts.values())
+            segment_counts = {
+                str(row["outcome"]): int(row["count"])
+                for row in connection.execute(
+                    """
+                    SELECT sc.outcome, COUNT(*) AS count FROM segment_completions sc
+                    JOIN review_items ri ON ri.id = sc.review_item_id
+                    WHERE ri.dataset_id = ? GROUP BY sc.outcome
+                    """,
+                    (dataset_id,),
+                )
+            }
+            reviewed = sum(segment_counts.values())
+            code_total = int(connection.execute(
+                """
+                SELECT COUNT(*) FROM code_reviews cr
+                JOIN review_items ri ON ri.id = cr.review_item_id
+                WHERE ri.dataset_id = ? AND cr.status <> 'abandoned'
+                """,
+                (dataset_id,),
+            ).fetchone()[0])
             generated = int(connection.execute(
                 """
-                SELECT COUNT(DISTINCT gs.review_item_id) FROM generation_snapshots gs
-                JOIN review_items ri ON ri.id = gs.review_item_id
-                WHERE ri.dataset_id = ? AND gs.status IN ('ready', 'invalid')
+                SELECT COUNT(*) FROM code_reviews cr
+                JOIN review_items ri ON ri.id = cr.review_item_id
+                WHERE ri.dataset_id = ? AND cr.status IN ('ready', 'invalid', 'finalized')
                 """,
                 (dataset_id,),
             ).fetchone()[0])
             invalid = int(connection.execute(
                 """
-                SELECT COUNT(DISTINCT gs.review_item_id) FROM generation_snapshots gs
-                JOIN review_items ri ON ri.id = gs.review_item_id
-                WHERE ri.dataset_id = ? AND gs.status = 'invalid'
+                SELECT COUNT(DISTINCT cr.id) FROM code_reviews cr
+                JOIN review_items ri ON ri.id = cr.review_item_id
+                LEFT JOIN code_decisions cd ON cd.code_review_id = cr.id
+                LEFT JOIN code_review_drafts draft ON draft.code_review_id = cr.id
+                JOIN candidates c
+                  ON c.snapshot_id = COALESCE(cd.snapshot_id, draft.snapshot_id)
+                WHERE ri.dataset_id = ? AND cr.status <> 'abandoned' AND c.valid = 0
                 """,
                 (dataset_id,),
             ).fetchone()[0])
@@ -729,11 +921,15 @@ class SQLiteStore:
             "total": total,
             "reviewed": reviewed,
             "unreviewed": total - reviewed,
+            "segment_completed": segment_counts.get("completed", 0),
             "generated": generated,
+            "code_total": code_total,
+            "code_unfinished": code_total - sum(decision_counts.values()),
             "preferred": decision_counts.get("prefer_a", 0) + decision_counts.get("prefer_b", 0),
             "both_poor": decision_counts.get("both_poor", 0),
             "too_similar": decision_counts.get("too_similar", 0),
             "skipped": decision_counts.get("skip", 0),
+            "segment_skipped": segment_counts.get("skipped", 0),
             "invalid": invalid,
         }
 
@@ -742,14 +938,22 @@ class SQLiteStore:
             rows = connection.execute(
                 """
                 SELECT ri.id, t.transcript_id, ri.segment_id, ri.record_id, ri.status,
-                       d.decision, d.reason, d.issue_tags_json, d.created_at,
-                       gs.status AS generation_status
+                       sc.outcome AS segment_outcome, sc.created_at,
+                       COUNT(DISTINCT cr.id) AS code_count,
+                       COUNT(DISTINCT cd.id) AS code_decision_count,
+                       SUM(CASE WHEN cd.decision IN ('prefer_a', 'prefer_b') THEN 1 ELSE 0 END)
+                           AS preferred_count,
+                       SUM(CASE WHEN cr.status = 'invalid' THEN 1 ELSE 0 END) AS invalid_count
                 FROM review_items ri
                 JOIN transcripts t ON t.id = ri.transcript_pk
-                LEFT JOIN decisions d ON d.review_item_id = ri.id
-                LEFT JOIN generation_snapshots gs
-                  ON gs.review_item_id = ri.id AND gs.status IN ('ready', 'invalid')
-                WHERE ri.dataset_id = ? ORDER BY ri.source_order
+                LEFT JOIN segment_completions sc ON sc.review_item_id = ri.id
+                LEFT JOIN code_reviews cr
+                  ON cr.review_item_id = ri.id AND cr.status <> 'abandoned'
+                LEFT JOIN code_decisions cd ON cd.code_review_id = cr.id
+                WHERE ri.dataset_id = ?
+                GROUP BY ri.id, t.transcript_id, ri.segment_id, ri.record_id, ri.status,
+                         sc.outcome, sc.created_at
+                ORDER BY ri.source_order
                 """,
                 (dataset_id,),
             ).fetchall()
@@ -795,8 +999,8 @@ def _supersede_live_snapshots_for_study(
         FROM generation_snapshots gs
         JOIN review_items ri ON ri.id = gs.review_item_id
         JOIN datasets d ON d.id = ri.dataset_id
-        LEFT JOIN decisions dec ON dec.review_item_id = ri.id
-        WHERE d.study_id = ? AND dec.id IS NULL
+        LEFT JOIN segment_completions sc ON sc.review_item_id = ri.id
+        WHERE d.study_id = ? AND sc.id IS NULL
           AND gs.status IN ('generating', 'ready', 'invalid')
         """,
         (study_id,),
@@ -808,10 +1012,22 @@ def _supersede_live_snapshots_for_study(
             SELECT gs.id FROM generation_snapshots gs
             JOIN review_items ri ON ri.id = gs.review_item_id
             JOIN datasets d ON d.id = ri.dataset_id
-            LEFT JOIN decisions dec ON dec.review_item_id = ri.id
-            WHERE d.study_id = ? AND dec.id IS NULL
+            LEFT JOIN segment_completions sc ON sc.review_item_id = ri.id
+            WHERE d.study_id = ? AND sc.id IS NULL
               AND gs.status IN ('generating', 'ready', 'invalid')
         )
+        """,
+        (now, study_id),
+    )
+    connection.execute(
+        """
+        UPDATE code_reviews SET status = 'draft', updated_at = ?
+        WHERE review_item_id IN (
+            SELECT ri.id FROM review_items ri
+            JOIN datasets d ON d.id = ri.dataset_id
+            LEFT JOIN segment_completions sc ON sc.review_item_id = ri.id
+            WHERE d.study_id = ? AND sc.id IS NULL
+        ) AND status IN ('generating', 'ready', 'invalid')
         """,
         (now, study_id),
     )
@@ -822,3 +1038,181 @@ def _supersede_live_snapshots_for_study(
             f"WHERE id IN ({placeholders})",
             (now, *(int(row[0]) for row in item_rows)),
         )
+
+
+def _backfill_multi_code_schema(connection: sqlite3.Connection) -> None:
+    """Wrap schema-v2 single-code records without rewriting their audit payloads."""
+    category_by_label = {spec.display_label: spec.id for spec in CATEGORY_SPECS}
+    item_rows = connection.execute(
+        """
+        SELECT DISTINCT ri.id AS review_item_id, s.reviewer_id
+        FROM review_items ri
+        JOIN datasets ds ON ds.id = ri.dataset_id
+        JOIN studies s ON s.id = ds.study_id
+        LEFT JOIN generation_snapshots gs ON gs.review_item_id = ri.id
+        LEFT JOIN decisions d ON d.review_item_id = ri.id
+        WHERE gs.id IS NOT NULL OR d.id IS NOT NULL
+        ORDER BY ri.id
+        """
+    ).fetchall()
+    for item in item_rows:
+        item_id = int(item["review_item_id"])
+        reviewer_id = str(item["reviewer_id"])
+        decision = connection.execute(
+            "SELECT * FROM decisions WHERE review_item_id = ? AND reviewer_id = ?",
+            (item_id, reviewer_id),
+        ).fetchone()
+        snapshots = connection.execute(
+            """
+            SELECT * FROM generation_snapshots
+            WHERE review_item_id = ? AND reviewer_id = ? ORDER BY attempt_number, id
+            """,
+            (item_id, reviewer_id),
+        ).fetchall()
+        if not snapshots:
+            if decision is not None and decision["decision"] == "skip":
+                connection.execute(
+                    """
+                    INSERT INTO segment_completions(
+                        review_item_id, reviewer_id, outcome, reason, issue_tags_json,
+                        idempotency_key, created_at
+                    ) VALUES (?, ?, 'skipped', ?, ?, ?, ?)
+                    """,
+                    (
+                        item_id, reviewer_id, decision["reason"], decision["issue_tags_json"],
+                        f"legacy-segment-{item_id}", decision["created_at"],
+                    ),
+                )
+            continue
+        selected = None
+        if decision is not None and decision["snapshot_id"] is not None:
+            selected = next(
+                (row for row in snapshots if int(row["id"]) == int(decision["snapshot_id"])),
+                None,
+            )
+        if selected is None:
+            selected = next(
+                (
+                    row for row in reversed(snapshots)
+                    if row["status"] in {"generating", "ready", "invalid"}
+                ),
+                snapshots[-1],
+            )
+        code_label = str(selected["code_label"])
+        source_status = str(selected["status"])
+        status = (
+            "finalized" if decision is not None
+            else source_status if source_status in {"generating", "ready", "invalid"}
+            else "draft"
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO code_reviews(
+                review_item_id, reviewer_id, ordinal, code_label, dedupe_label,
+                status, created_at, updated_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id, reviewer_id, code_label, code_label.strip(), status,
+                selected["created_at"], selected["updated_at"],
+            ),
+        )
+        code_review_id = int(cursor.lastrowid)
+        connection.execute(
+            "UPDATE generation_snapshots SET code_review_id = ? WHERE review_item_id = ?",
+            (code_review_id, item_id),
+        )
+        categories = _snapshot_display_categories(
+            connection, int(selected["id"]), category_by_label
+        )
+        if decision is None:
+            connection.execute(
+                """
+                INSERT INTO code_review_drafts(
+                    code_review_id, snapshot_id, category_a_id, category_b_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    code_review_id, int(selected["id"]), categories.get("A"),
+                    categories.get("B"), selected["updated_at"],
+                ),
+            )
+            continue
+        cursor = connection.execute(
+            """
+            INSERT INTO code_decisions(
+                code_review_id, snapshot_id, reviewer_id, decision,
+                preferred_candidate_id, reason, issue_tags_json, idempotency_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                code_review_id, decision["snapshot_id"], reviewer_id, decision["decision"],
+                decision["preferred_candidate_id"], decision["reason"],
+                decision["issue_tags_json"], decision["idempotency_key"],
+                decision["created_at"],
+            ),
+        )
+        code_decision_id = int(cursor.lastrowid)
+        candidate_rows = connection.execute(
+            """
+            SELECT ab.display_label, c.id
+            FROM ab_assignments ab JOIN candidates c ON c.id = ab.candidate_id
+            WHERE ab.snapshot_id = ? ORDER BY ab.display_label
+            """,
+            (selected["id"],),
+        ).fetchall()
+        for candidate in candidate_rows:
+            display_label = str(candidate["display_label"])
+            category_id = categories.get(display_label)
+            if category_id:
+                connection.execute(
+                    """
+                    INSERT INTO code_decision_categories(
+                        decision_id, display_label, candidate_id, category_id
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        code_decision_id, display_label, int(candidate["id"]), category_id,
+                    ),
+                )
+        connection.execute(
+            """
+            INSERT INTO segment_completions(
+                review_item_id, reviewer_id, outcome, reason, issue_tags_json,
+                idempotency_key, created_at
+            ) VALUES (?, ?, 'completed', NULL, '[]', ?, ?)
+            """,
+            (item_id, reviewer_id, f"legacy-segment-{item_id}", decision["created_at"]),
+        )
+
+
+def _snapshot_display_categories(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+    category_by_label: dict[str, str],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    rows = connection.execute(
+        """
+        SELECT ab.display_label, c.parsed_json, c.rendered_text
+        FROM ab_assignments ab JOIN candidates c ON c.id = ab.candidate_id
+        WHERE ab.snapshot_id = ?
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    for row in rows:
+        category_id = None
+        if row["parsed_json"]:
+            try:
+                payload = json.loads(str(row["parsed_json"]))
+                if isinstance(payload, dict):
+                    category_id = payload.get("category_id")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if not category_id and row["rendered_text"]:
+            first_line = str(row["rendered_text"]).splitlines()[0]
+            if first_line.startswith("Code category:"):
+                category_id = category_by_label.get(first_line.split(":", 1)[1].strip())
+        if category_id in {spec.id for spec in CATEGORY_SPECS}:
+            result[str(row["display_label"])] = str(category_id)
+    return result
