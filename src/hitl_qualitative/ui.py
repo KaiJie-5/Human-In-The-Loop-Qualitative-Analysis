@@ -14,7 +14,7 @@ from .database import QuestionDraft, SQLiteStore
 from .exporting import PreferenceExporter
 from .ollama_client import HttpOllamaClient, OllamaError
 from .transcripts import TranscriptAdapter, TranscriptTurn, select_context
-from .workflow import ISSUE_TAGS, CodeReviewView, ReviewService, segment_idempotency_key
+from .workflow import CodeReviewView, ReviewService, segment_idempotency_key
 
 
 DECISION_LABELS = {
@@ -418,14 +418,12 @@ def review_page() -> None:
         with st.expander("Skip this target segment"):
             with st.form(f"skip_segment_{item.id}"):
                 reason = st.text_area("Optional skip reason", height=70)
-                tags = st.multiselect("Optional issue tags", ISSUE_TAGS)
                 skip = st.form_submit_button("Skip this segment")
             if skip:
                 try:
                     service.skip_segment(
                         item,
                         reason=reason,
-                        issue_tags=tags,
                         idempotency_key=segment_idempotency_key(
                             item.id, item.reviewer_id, "skip"
                         ),
@@ -510,7 +508,8 @@ def _code_response_group(
             ) or candidate.model_category_id
             category_ids = [spec.id for spec in CATEGORY_SPECS]
             selected = st.selectbox(
-                "Code category",
+                "Please choose the most suitable code category. "
+                "The DPO model's recommendation is preselected below.",
                 category_ids,
                 index=category_ids.index(default_category) if default_category in category_ids else 0,
                 format_func=lambda value: CATEGORY_BY_ID[value].display_label,
@@ -535,22 +534,16 @@ def _code_response_group(
     if initial_label not in allowed:
         initial_label = "Choose a decision…"
     decision_label = st.selectbox(
-        "Decision",
+        "Which reflective question is more suitable for this qualitative code?",
         allowed,
         index=allowed.index(initial_label),
         key=f"decision_{code.id}_{snapshot.id}",
     )
     reason = st.text_area(
-        "Optional reason",
+        "Comment",
         value=code.draft.reason,
         height=70,
         key=f"reason_{code.id}_{snapshot.id}",
-    )
-    tags = st.multiselect(
-        "Optional issue tags",
-        ISSUE_TAGS,
-        default=list(code.draft.issue_tags),
-        key=f"tags_{code.id}_{snapshot.id}",
     )
     decision = DECISION_LABELS[decision_label]
     try:
@@ -562,7 +555,6 @@ def _code_response_group(
             category_a_id=effective.get("A"),
             category_b_id=effective.get("B"),
             reason=reason,
-            issue_tags=tags,
         )
         st.caption("Draft saved automatically.")
     except Exception as exc:
